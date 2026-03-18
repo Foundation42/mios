@@ -6,6 +6,11 @@ const js_mod = @import("js.zig");
 const perf_mod = @import("perf.zig");
 const display_mod = @import("display.zig");
 
+const TITLE_BAR_H = display_mod.TITLE_BAR_H;
+const RESIZE_GRIP: f32 = 6; // edge zone for resize
+
+const DragTarget = enum { none, term_title, term_resize, display };
+
 pub fn main() !void {
     // --- Raylib init ---
     rl.setConfigFlags(rl.FLAG_MSAA_4X_HINT | rl.FLAG_WINDOW_RESIZABLE | rl.FLAG_VSYNC_HINT);
@@ -34,12 +39,22 @@ pub fn main() !void {
     // Auto-launch shell.js
     var shell_started = false;
 
-    // Terminal screen position (updated each frame)
-    var term_x: f32 = 0;
-    var term_y: f32 = 0;
+    // Terminal window position (top-left of title bar)
+    var term_wx: f32 = 50;
+    var term_wy: f32 = 50;
 
     // Which display is focused (null = terminal or nothing)
     var focused_display: ?usize = null;
+
+    // Drag state
+    var drag_target: DragTarget = .none;
+    var drag_offset_x: f32 = 0;
+    var drag_offset_y: f32 = 0;
+    // For resize: initial window size and mouse pos at drag start
+    var resize_start_w: f32 = 0;
+    var resize_start_h: f32 = 0;
+    var resize_start_mx: f32 = 0;
+    var resize_start_my: f32 = 0;
 
     while (!rl.windowShouldClose()) {
         const sw = rl.getScreenWidth();
@@ -71,15 +86,35 @@ pub fn main() !void {
             }
         }
 
+        // --- Terminal geometry ---
+        const term_tex_w: f32 = @floatFromInt(term.render_tex.texture.width);
+        const term_tex_h: f32 = @floatFromInt(term.render_tex.texture.height);
+        const term_content_y = term_wy + TITLE_BAR_H;
+        const term_total_h = TITLE_BAR_H + term_tex_h;
+
         // --- Hit testing ---
         const mouse = rl.c.GetMousePosition();
-        const mouse_over_term = term.visible and hitTestRect(
-            mouse,
-            term_x,
-            term_y,
-            @floatFromInt(term.render_tex.texture.width),
-            @floatFromInt(term.render_tex.texture.height),
-        );
+
+        const mouse_over_term_title = term.visible and
+            mouse.x >= term_wx and mouse.x < term_wx + term_tex_w and
+            mouse.y >= term_wy and mouse.y < term_content_y;
+
+        const mouse_over_term_content = term.visible and
+            mouse.x >= term_wx and mouse.x < term_wx + term_tex_w and
+            mouse.y >= term_content_y and mouse.y < term_content_y + term_tex_h;
+
+        const mouse_over_term_resize = term.visible and
+            mouse.x >= term_wx + term_tex_w - RESIZE_GRIP and mouse.x < term_wx + term_tex_w + RESIZE_GRIP and
+            mouse.y >= term_wy + term_total_h - RESIZE_GRIP and mouse.y < term_wy + term_total_h + RESIZE_GRIP;
+
+        // Set cursor shape for resize grip
+        if (mouse_over_term_resize and drag_target == .none) {
+            rl.c.SetMouseCursor(rl.c.MOUSE_CURSOR_RESIZE_NWSE);
+        } else if (drag_target == .term_resize) {
+            rl.c.SetMouseCursor(rl.c.MOUSE_CURSOR_RESIZE_NWSE);
+        } else {
+            rl.c.SetMouseCursor(rl.c.MOUSE_CURSOR_DEFAULT);
+        }
 
         // --- Input ---
         // F11: fullscreen toggle (always available)
@@ -100,7 +135,7 @@ pub fn main() !void {
 
         // --- Mouse click handling ---
         if (rl.c.IsMouseButtonPressed(rl.c.MOUSE_BUTTON_LEFT)) {
-            // Check close button first (topmost window)
+            // Check display close button first
             if (js.display_mgr.hitTestCloseBtn(mouse.x, mouse.y)) |idx| {
                 js.display_mgr.displays[idx].active = false;
                 if (focused_display) |fd| {
@@ -110,7 +145,30 @@ pub fn main() !void {
                     }
                 }
             }
-            // Check title bar → start drag
+            // Terminal resize grip
+            else if (mouse_over_term_resize) {
+                drag_target = .term_resize;
+                resize_start_w = term_tex_w;
+                resize_start_h = term_tex_h;
+                resize_start_mx = mouse.x;
+                resize_start_my = mouse.y;
+                term.focused = true;
+                focused_display = null;
+            }
+            // Terminal title bar → drag
+            else if (mouse_over_term_title) {
+                drag_target = .term_title;
+                drag_offset_x = mouse.x - term_wx;
+                drag_offset_y = mouse.y - term_wy;
+                term.focused = true;
+                focused_display = null;
+            }
+            // Terminal content → focus
+            else if (mouse_over_term_content) {
+                term.focused = true;
+                focused_display = null;
+            }
+            // Display title bar → drag
             else if (js.display_mgr.hitTestTitleBar(mouse.x, mouse.y)) |idx| {
                 js.display_mgr.dragging = @intCast(idx);
                 js.display_mgr.drag_offset_x = mouse.x - js.display_mgr.displays[idx].screen_x;
@@ -118,19 +176,15 @@ pub fn main() !void {
                 js.display_mgr.bringToFront(@intCast(idx));
                 focused_display = idx;
                 term.focused = false;
+                drag_target = .display;
             }
-            // Check display content → focus window
+            // Display content → focus
             else if (js.display_mgr.hitTestContent(mouse.x, mouse.y)) |idx| {
                 js.display_mgr.bringToFront(@intCast(idx));
                 focused_display = idx;
                 term.focused = false;
             }
-            // Check terminal
-            else if (mouse_over_term) {
-                term.focused = true;
-                focused_display = null;
-            }
-            // Click on empty space — focus terminal
+            // Empty space → focus terminal
             else {
                 term.focused = true;
                 focused_display = null;
@@ -139,14 +193,31 @@ pub fn main() !void {
 
         // Drag update
         if (rl.c.IsMouseButtonDown(rl.c.MOUSE_BUTTON_LEFT)) {
-            if (js.display_mgr.dragging) |drag_id| {
-                js.display_mgr.displays[drag_id].screen_x = mouse.x - js.display_mgr.drag_offset_x;
-                js.display_mgr.displays[drag_id].screen_y = mouse.y - js.display_mgr.drag_offset_y;
+            switch (drag_target) {
+                .term_title => {
+                    term_wx = mouse.x - drag_offset_x;
+                    term_wy = mouse.y - drag_offset_y;
+                },
+                .term_resize => {
+                    const new_w = resize_start_w + (mouse.x - resize_start_mx);
+                    const new_h = resize_start_h + (mouse.y - resize_start_my);
+                    const new_cols: u16 = @intFromFloat(@max(10, new_w / term.cell_w));
+                    const new_rows: u16 = @intFromFloat(@max(4, new_h / term.cell_h));
+                    term.resize(new_cols, new_rows);
+                },
+                .display => {
+                    if (js.display_mgr.dragging) |drag_id| {
+                        js.display_mgr.displays[drag_id].screen_x = mouse.x - js.display_mgr.drag_offset_x;
+                        js.display_mgr.displays[drag_id].screen_y = mouse.y - js.display_mgr.drag_offset_y;
+                    }
+                },
+                .none => {},
             }
         }
 
         // Drag end
         if (rl.c.IsMouseButtonReleased(rl.c.MOUSE_BUTTON_LEFT)) {
+            drag_target = .none;
             js.display_mgr.dragging = null;
         }
 
@@ -160,7 +231,7 @@ pub fn main() !void {
             }
 
             // Terminal gets keyboard; scroll only when mouse is over it
-            if (mouse_over_term) {
+            if (mouse_over_term_content) {
                 term.handleInput();
             } else {
                 term.handleInputNoScroll();
@@ -185,18 +256,41 @@ pub fn main() !void {
         js.display_mgr.drawAll(focused_display);
         perf.lapEnd(perf_mod.DISPLAY);
 
-        // Terminal
+        // Terminal with chrome
         perf.lapStart();
         if (term.visible) {
-            const term_tex_w: f32 = @floatFromInt(term.render_tex.texture.width);
-            const term_tex_h: f32 = @floatFromInt(term.render_tex.texture.height);
-            const screen_w: f32 = @floatFromInt(sw);
-            const screen_h: f32 = @floatFromInt(sh);
+            const tw = @as(f32, @floatFromInt(term.render_tex.texture.width));
+            const th = @as(f32, @floatFromInt(term.render_tex.texture.height));
 
-            // Center the terminal
-            term_x = (screen_w - term_tex_w) / 2;
-            term_y = (screen_h - term_tex_h) / 2;
-            term.draw(term_x, term_y);
+            // Title bar
+            const title_color = if (term.focused) rl.color(0, 120, 90, 240) else rl.color(0, 80, 60, 220);
+            rl.c.DrawRectangleV(
+                .{ .x = term_wx, .y = term_wy },
+                .{ .x = tw, .y = TITLE_BAR_H },
+                title_color,
+            );
+            rl.c.DrawText("Terminal", @intFromFloat(term_wx + 6), @intFromFloat(term_wy + 4), 14, rl.color(0, 255, 180, 220));
+
+            // Terminal content
+            term.draw(term_wx, term_content_y);
+
+            // Border
+            const border_color = if (term.focused) rl.color(0, 255, 180, 220) else rl.color(0, 255, 180, 80);
+            rl.c.DrawRectangleLinesEx(
+                .{ .x = term_wx, .y = term_wy, .width = tw, .height = TITLE_BAR_H + th },
+                1,
+                border_color,
+            );
+
+            // Resize grip (bottom-right corner triangle)
+            const gx = term_wx + tw;
+            const gy = term_wy + TITLE_BAR_H + th;
+            rl.c.DrawTriangle(
+                .{ .x = gx, .y = gy - 12 },
+                .{ .x = gx, .y = gy },
+                .{ .x = gx - 12, .y = gy },
+                rl.color(0, 255, 180, 100),
+            );
         }
 
         perf.endFrame();
@@ -206,11 +300,6 @@ pub fn main() !void {
 
         rl.endDrawing();
     }
-}
-
-/// Point-in-rectangle hit test
-fn hitTestRect(p: rl.c.Vector2, x: f32, y: f32, w: f32, h: f32) bool {
-    return p.x >= x and p.x < x + w and p.y >= y and p.y < y + h;
 }
 
 fn findScript(name: []const u8, buf: *[512]u8) ?[]const u8 {

@@ -176,6 +176,56 @@ pub const Terminal = struct {
         self.initialized = false;
     }
 
+    /// Resize the terminal to new dimensions. Preserves existing content where possible.
+    pub fn resize(self: *Terminal, new_cols: u16, new_rows: u16) void {
+        if (!self.initialized) return;
+        const cols = @min(new_cols, MAX_COLS);
+        const rows = @min(new_rows, MAX_ROWS);
+        if (cols == self.cols and rows == self.rows) return;
+        if (cols < 10 or rows < 4) return; // minimum viable size
+
+        // Copy visible content to a temp buffer
+        var tmp: [MAX_ROWS * MAX_COLS]Cell = undefined;
+        const copy_rows = @min(rows, self.rows);
+        const copy_cols = @min(cols, self.cols);
+        // Clear the temp buffer
+        for (0..@as(usize, rows) * @as(usize, cols)) |i| {
+            tmp[i] = .{};
+        }
+        // Copy existing cells
+        for (0..copy_rows) |r| {
+            const src_off = r * @as(usize, self.cols);
+            const dst_off = r * @as(usize, cols);
+            @memcpy(tmp[dst_off..][0..copy_cols], self.cells_back[src_off..][0..copy_cols]);
+        }
+
+        // Update dimensions
+        self.cols = cols;
+        self.rows = rows;
+
+        // Copy back
+        @memcpy(self.cells_back[0..@as(usize, rows) * @as(usize, cols)], tmp[0..@as(usize, rows) * @as(usize, cols)]);
+        @memcpy(self.cells_front[0..@as(usize, rows) * @as(usize, cols)], tmp[0..@as(usize, rows) * @as(usize, cols)]);
+
+        // Clamp cursor
+        if (self.cursor_col >= cols) self.cursor_col = cols - 1;
+        if (self.cursor_row >= rows) self.cursor_row = rows - 1;
+
+        // Reset scroll region
+        self.scroll_top = 0;
+        self.scroll_bottom = rows - 1;
+
+        // Reallocate render texture
+        rl.c.UnloadRenderTexture(self.render_tex);
+        const tex_w: c_int = @intFromFloat(self.cell_w * @as(f32, @floatFromInt(cols)));
+        const tex_h: c_int = @intFromFloat(self.cell_h * @as(f32, @floatFromInt(rows)));
+        self.render_tex = rl.c.LoadRenderTexture(tex_w, tex_h);
+        rl.c.SetTextureFilter(self.render_tex.texture, rl.c.TEXTURE_FILTER_BILINEAR);
+
+        self.full_dirty = true;
+        self.any_dirty = true;
+    }
+
     fn clearGrid(self: *const Terminal, grid: []Cell) void {
         const n = @as(usize, self.rows) * @as(usize, self.cols);
         for (grid[0..n]) |*cell| {
