@@ -1,6 +1,7 @@
 const std = @import("std");
 const terminal_mod = @import("terminal.zig");
 const display_mod = @import("display.zig");
+const bridge_mod = @import("bridge.zig");
 
 pub const c = @cImport({
     @cInclude("quickjs.h");
@@ -78,6 +79,11 @@ pub const JsRuntime = struct {
     mem_js_func_count: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     mem_poll_counter: u32 = 0, // worker-only counter to throttle idle mem updates
     qjs_rt: ?*c.JSRuntime = null, // set by worker thread, used for mem stats
+
+    // Microkernel bridge (worker thread only)
+    bridge: bridge_mod.Connection = .{},
+    name_cache: bridge_mod.NameCache = .{},
+    bridge_alloc: std.mem.Allocator = std.heap.page_allocator,
 
     const history_path = ".mios_history";
 
@@ -481,6 +487,16 @@ pub const JsRuntime = struct {
         _ = c.JS_SetPropertyStr(ctx, gfx_obj, "rgb", c.JS_NewCFunction(ctx, jsGfxRgb, "rgb", 3));
         _ = c.JS_SetPropertyStr(ctx, gfx_obj, "rgba", c.JS_NewCFunction(ctx, jsGfxRgba, "rgba", 4));
         _ = c.JS_SetPropertyStr(ctx, global, "gfx", gfx_obj);
+
+        // actor object — microkernel bridge
+        const actor_obj = c.JS_NewObject(ctx);
+        _ = c.JS_SetPropertyStr(ctx, actor_obj, "connect", c.JS_NewCFunction(ctx, jsActorConnect, "connect", 1));
+        _ = c.JS_SetPropertyStr(ctx, actor_obj, "connectTcp", c.JS_NewCFunction(ctx, jsActorConnectTcp, "connectTcp", 2));
+        _ = c.JS_SetPropertyStr(ctx, actor_obj, "send", c.JS_NewCFunction(ctx, jsActorSend, "send", 3));
+        _ = c.JS_SetPropertyStr(ctx, actor_obj, "recv", c.JS_NewCFunction(ctx, jsActorRecv, "recv", 0));
+        _ = c.JS_SetPropertyStr(ctx, actor_obj, "connected", c.JS_NewCFunction(ctx, jsActorConnected, "connected", 0));
+        _ = c.JS_SetPropertyStr(ctx, actor_obj, "close", c.JS_NewCFunction(ctx, jsActorClose, "close", 0));
+        _ = c.JS_SetPropertyStr(ctx, global, "actor", actor_obj);
     }
 
     fn getSelf(ctx: ?*c.JSContext) *JsRuntime {
@@ -1505,6 +1521,138 @@ pub const JsRuntime = struct {
 
         std.fs.cwd().access(path, .{}) catch return c.qjs_false();
         return c.qjs_true();
+    }
+
+    // ---------------------------------------------------------------
+    // Actor bridge functions
+    // ---------------------------------------------------------------
+
+    /// actor.connect(path) — connect to microkernel via Unix socket
+    fn jsActorConnect(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        if (argc < 1) return c.qjs_false();
+        const self = getSelf(ctx);
+        const path_c = c.JS_ToCString(ctx, argv[0]);
+        if (path_c == null) return c.qjs_false();
+        defer c.JS_FreeCString(ctx, path_c);
+        const path = cStrToSlice(path_c);
+
+        self.bridge.close();
+        self.bridge.connectUnix(path) catch {
+            self.pushOutputFmt("\x1b[1;31mactor.connect: failed to connect to {s}\x1b[0m\r\n", .{path});
+            return c.qjs_false();
+        };
+        self.pushOutputFmt("\x1b[1;32mConnected to {s}\x1b[0m\r\n", .{path});
+        return c.qjs_true();
+    }
+
+    /// actor.connectTcp(host, port) — connect to microkernel via TCP
+    fn jsActorConnectTcp(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        if (argc < 2) return c.qjs_false();
+        const self = getSelf(ctx);
+        const host_c = c.JS_ToCString(ctx, argv[0]);
+        if (host_c == null) return c.qjs_false();
+        defer c.JS_FreeCString(ctx, host_c);
+        const host = cStrToSlice(host_c);
+
+        var port: i32 = 0;
+        _ = c.JS_ToInt32(ctx, &port, argv[1]);
+
+        self.bridge.close();
+        self.bridge.connectTcp(host, @intCast(@as(u32, @bitCast(port)) & 0xFFFF)) catch {
+            self.pushOutputFmt("\x1b[1;31mactor.connectTcp: failed to connect to {s}:{d}\x1b[0m\r\n", .{ host, port });
+            return c.qjs_false();
+        };
+        self.pushOutputFmt("\x1b[1;32mConnected to {s}:{d}\x1b[0m\r\n", .{ host, port });
+        return c.qjs_true();
+    }
+
+    /// actor.send(dest, type, payload) — send a message
+    /// dest: actor_id (number) or path (string, future: auto-lookup)
+    /// type: message type (number)
+    /// payload: string
+    fn jsActorSend(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        if (argc < 2) return c.qjs_false();
+        const self = getSelf(ctx);
+        const real_ctx = ctx orelse return c.qjs_false();
+
+        if (!self.bridge.isConnected()) return c.qjs_false();
+
+        // Dest: number (actor_id) or string (path for future lookup)
+        var dest: u64 = 0;
+        if (c.JS_IsNumber(argv[0]) != 0) {
+            var id: i64 = 0;
+            _ = c.JS_ToInt64(real_ctx, &id, argv[0]);
+            dest = @bitCast(id);
+        } else {
+            // String path — check name cache
+            const path_c = c.JS_ToCString(real_ctx, argv[0]);
+            if (path_c != null) {
+                defer c.JS_FreeCString(real_ctx, path_c);
+                const path = cStrToSlice(path_c);
+                if (self.name_cache.lookup(path)) |cached_id| {
+                    dest = cached_id;
+                } else {
+                    self.pushOutputFmt("\x1b[1;31mactor.send: unknown path '{s}' (use actor.lookup first)\x1b[0m\r\n", .{path});
+                    return c.qjs_false();
+                }
+            }
+        }
+
+        // Type
+        var msg_type: i32 = 0;
+        _ = c.JS_ToInt32(real_ctx, &msg_type, argv[1]);
+
+        // Payload (optional string)
+        var payload: []const u8 = "";
+        var payload_c: [*c]const u8 = null;
+        if (argc >= 3) {
+            payload_c = c.JS_ToCString(real_ctx, argv[2]);
+            if (payload_c != null) {
+                payload = cStrToSlice(payload_c);
+            }
+        }
+        defer if (payload_c != null) c.JS_FreeCString(real_ctx, payload_c);
+
+        const msg = bridge_mod.Message{
+            .source = 0, // MiOS doesn't have an actor ID yet
+            .dest = dest,
+            .msg_type = @bitCast(msg_type),
+            .payload = payload,
+        };
+
+        const ok = self.bridge.send(self.bridge_alloc, msg);
+        return if (ok) c.qjs_true() else c.qjs_false();
+    }
+
+    /// actor.recv() — receive a message (non-blocking). Returns {source, type, payload} or null.
+    fn jsActorRecv(ctx: ?*c.JSContext, _: c.JSValue, _: c_int, _: [*c]c.JSValue) callconv(.c) c.JSValue {
+        const self = getSelf(ctx);
+        const real_ctx = ctx orelse return c.qjs_null();
+
+        if (!self.bridge.isConnected()) return c.qjs_null();
+
+        const msg = self.bridge.recv(self.bridge_alloc) orelse return c.qjs_null();
+        defer if (msg.payload.len > 0) self.bridge_alloc.free(msg.payload);
+
+        // Return as JS object {source, type, payload}
+        const obj = c.JS_NewObject(real_ctx);
+        _ = c.JS_SetPropertyStr(real_ctx, obj, "source", c.JS_NewInt64(real_ctx, @bitCast(msg.source)));
+        _ = c.JS_SetPropertyStr(real_ctx, obj, "type", c.JS_NewInt64(real_ctx, @intCast(msg.msg_type)));
+        _ = c.JS_SetPropertyStr(real_ctx, obj, "payload", c.JS_NewStringLen(real_ctx, msg.payload.ptr, msg.payload.len));
+        return obj;
+    }
+
+    /// actor.connected() — check if connected
+    fn jsActorConnected(ctx: ?*c.JSContext, _: c.JSValue, _: c_int, _: [*c]c.JSValue) callconv(.c) c.JSValue {
+        const self = getSelf(ctx);
+        return if (self.bridge.isConnected()) c.qjs_true() else c.qjs_false();
+    }
+
+    /// actor.close() — disconnect
+    fn jsActorClose(ctx: ?*c.JSContext, _: c.JSValue, _: c_int, _: [*c]c.JSValue) callconv(.c) c.JSValue {
+        const self = getSelf(ctx);
+        self.bridge.close();
+        return c.qjs_undefined();
     }
 };
 

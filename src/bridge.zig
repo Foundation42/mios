@@ -54,7 +54,8 @@ pub fn serialize(alloc: std.mem.Allocator, msg: Message, mode: Mode) ![]u8 {
 /// Deserialize a wire header from bytes. Returns null if buffer too small.
 pub fn deserializeHeader(buf: []const u8, mode: Mode) ?WireHeader {
     if (buf.len < WIRE_HEADER_SIZE) return null;
-    var hdr: WireHeader = @bitCast(buf[0..WIRE_HEADER_SIZE].*);
+    const ptr: *const WireHeader = @ptrCast(@alignCast(buf.ptr));
+    var hdr = ptr.*;
 
     if (mode == .network) {
         hdr.source = @byteSwap(hdr.source);
@@ -106,14 +107,6 @@ pub const Connection = struct {
 
     /// Connect to a TCP host:port (network byte order).
     pub fn connectTcp(self: *Connection, host: []const u8, port: u16) !void {
-        // Resolve address
-        var hints: std.net.AddressList.Hints = .{
-            .family = .inet,
-            .sock_type = .stream,
-        };
-        _ = hints;
-
-        // Simple IPv4 connect
         const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
         errdefer posix.close(fd);
 
