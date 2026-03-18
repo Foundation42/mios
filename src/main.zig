@@ -43,6 +43,10 @@ pub fn main() !void {
     var term_wx: f32 = 50;
     var term_wy: f32 = 50;
 
+    // Track previous window size for resize detection
+    var prev_sw = rl.getScreenWidth();
+    var prev_sh = rl.getScreenHeight();
+
     // Which display is focused (null = terminal or nothing)
     var focused_display: ?usize = null;
 
@@ -59,6 +63,20 @@ pub fn main() !void {
     while (!rl.windowShouldClose()) {
         const sw = rl.getScreenWidth();
         const sh = rl.getScreenHeight();
+
+        // --- App window resize → resize terminal to fit ---
+        if (sw != prev_sw or sh != prev_sh) {
+            const margin: f32 = 100; // leave some room for display windows
+            const avail_w = @as(f32, @floatFromInt(sw)) - margin;
+            const avail_h = @as(f32, @floatFromInt(sh)) - margin - TITLE_BAR_H;
+            if (avail_w > 0 and avail_h > 0) {
+                const new_cols: u16 = @intFromFloat(@max(20, avail_w / term.cell_w));
+                const new_rows: u16 = @intFromFloat(@max(6, avail_h / term.cell_h));
+                term.resize(new_cols, new_rows);
+            }
+            prev_sw = sw;
+            prev_sh = sh;
+        }
 
         // Drain JS output to terminal
         js.drainOutput();
@@ -107,6 +125,8 @@ pub fn main() !void {
             mouse.x >= term_wx + term_tex_w - RESIZE_GRIP and mouse.x < term_wx + term_tex_w + RESIZE_GRIP and
             mouse.y >= term_wy + term_total_h - RESIZE_GRIP and mouse.y < term_wy + term_total_h + RESIZE_GRIP;
 
+        const mouse_over_term_any = mouse_over_term_title or mouse_over_term_content or mouse_over_term_resize;
+
         // Set cursor shape for resize grip
         if (mouse_over_term_resize and drag_target == .none) {
             rl.c.SetMouseCursor(rl.c.MOUSE_CURSOR_RESIZE_NWSE);
@@ -138,6 +158,8 @@ pub fn main() !void {
             // Check display close button first
             if (js.display_mgr.hitTestCloseBtn(mouse.x, mouse.y)) |idx| {
                 js.display_mgr.displays[idx].active = false;
+                // Interrupt the JS program so it stops rendering to this display
+                js.c_flags[1] = 1;
                 if (focused_display) |fd| {
                     if (fd == idx) {
                         focused_display = null;
@@ -178,7 +200,7 @@ pub fn main() !void {
                 term.focused = false;
                 drag_target = .display;
             }
-            // Display content → focus
+            // Display content → focus + bring to front
             else if (js.display_mgr.hitTestContent(mouse.x, mouse.y)) |idx| {
                 js.display_mgr.bringToFront(@intCast(idx));
                 focused_display = idx;
@@ -230,11 +252,11 @@ pub fn main() !void {
                 }
             }
 
-            // Terminal gets keyboard; scroll only when mouse is over it
-            if (mouse_over_term_content) {
-                term.handleInput();
-            } else {
-                term.handleInputNoScroll();
+            // Keyboard always goes to terminal when focused
+            term.handleInputNoScroll();
+            // Scroll only when mouse is over the terminal window
+            if (mouse_over_term_any) {
+                term.handleScroll();
             }
             term.update(rl.getFrameTime());
         } else {
