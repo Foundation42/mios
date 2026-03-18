@@ -7,11 +7,7 @@ const perf_mod = @import("perf.zig");
 const display_mod = @import("display.zig");
 const node_mod = @import("node.zig");
 const bridge_mod = @import("bridge.zig");
-
-const TITLE_BAR_H = display_mod.TITLE_BAR_H;
-const RESIZE_GRIP: f32 = 6; // edge zone for resize
-
-const DragTarget = enum { none, term_title, term_resize, display, remote_term_title };
+const wm = @import("wm.zig");
 
 pub fn main() !void {
     // --- Raylib init ---
@@ -19,17 +15,23 @@ pub fn main() !void {
     rl.initWindow(constants.WINDOW_W, constants.WINDOW_H, "MiOS");
     defer rl.closeWindow();
     rl.setTargetFPS(constants.TARGET_FPS);
-    rl.c.SetExitKey(0); // ESC is for programs, not quitting
+    rl.c.SetExitKey(0);
 
     const font = rl.getFontDefault();
     const allocator = std.heap.page_allocator;
 
-    // --- Terminal ---
+    // --- Window manager ---
+    var win_mgr = wm.WindowManager{};
+    win_mgr.init();
+
+    // --- Local terminal ---
     var term = terminal_mod.Terminal{};
     term.init(100, 30, 14);
     defer term.deinit();
     term.visible = true;
     term.focused = true;
+    const local_win = win_mgr.createWindow(&term, .local, "Terminal", 50, 50) orelse 0;
+    win_mgr.focused = local_win;
 
     // --- JavaScript runtime ---
     var js: js_mod.JsRuntime = .{};
@@ -40,11 +42,7 @@ pub fn main() !void {
     var nodes = node_mod.NodeManager{};
     nodes.start();
     defer nodes.stop();
-
-    // Remote terminals (heap-allocated, one per mounted node)
-    var remote_terms: [node_mod.MAX_NODES]?*terminal_mod.Terminal = .{null} ** node_mod.MAX_NODES;
-    var remote_term_x: [node_mod.MAX_NODES]f32 = .{0} ** node_mod.MAX_NODES;
-    var remote_term_y: [node_mod.MAX_NODES]f32 = .{0} ** node_mod.MAX_NODES;
+    js.node_mgr = &nodes;
 
     // --- Performance monitor ---
     var perf = perf_mod.PerfTimers{ .js = &js };
@@ -52,30 +50,8 @@ pub fn main() !void {
     // Auto-launch shell.js
     var shell_started = false;
 
-    // Terminal window position (top-left of title bar)
-    var term_wx: f32 = 50;
-    var term_wy: f32 = 50;
-
-    // Which display is focused (null = terminal or nothing)
+    // Display focus (for gfx windows, separate from terminal windows)
     var focused_display: ?usize = null;
-
-    // Drag state
-    var drag_target: DragTarget = .none;
-    var drag_offset_x: f32 = 0;
-    var drag_offset_y: f32 = 0;
-    var resize_start_w: f32 = 0;
-    var resize_start_h: f32 = 0;
-    var resize_start_mx: f32 = 0;
-    var resize_start_my: f32 = 0;
-    var drag_remote_idx: usize = 0;
-
-    // Remote terminal input
-    var remote_term_focused: ?usize = null;
-    var remote_input_buf: [1024]u8 = undefined;
-    var remote_input_len: usize = 0;
-
-    // Expose node manager to JS runtime so JS can request mounts
-    js.node_mgr = &nodes;
 
     while (!rl.windowShouldClose()) {
         const sw = rl.getScreenWidth();
@@ -87,36 +63,39 @@ pub fn main() !void {
         // --- Node manager: process mount results ---
         while (nodes.popMountResult()) |result| {
             if (result.disconnected) {
-                if (remote_terms[result.slot]) |rt| {
-                    rt.deinit();
-                    allocator.destroy(rt);
-                    remote_terms[result.slot] = null;
-                }
+                // TODO: close terminal window for this node
                 term.write("\x1b[1;31mNode disconnected\x1b[0m\r\n");
             } else if (result.success) {
-                // Create terminal for this remote node
                 const rt = allocator.create(terminal_mod.Terminal) catch continue;
                 rt.* = .{};
                 rt.init(80, 24, 14);
                 rt.visible = true;
                 rt.focused = false;
-                remote_terms[result.slot] = rt;
+
+                // Build title from identity
+                var title_buf: [48]u8 = .{0} ** 48;
+                const ident = result.identity[0..result.identity_len];
+                _ = std.fmt.bufPrint(&title_buf, "{s}", .{ident}) catch {};
 
                 const offset: f32 = @floatFromInt(result.slot);
-                remote_term_x[result.slot] = term_wx + 200 + offset * 30;
-                remote_term_y[result.slot] = term_wy + 50 + offset * 30;
+                const win_idx = win_mgr.createWindow(rt, .{ .remote = result.slot }, &title_buf, 250 + offset * 30, 50 + offset * 30);
 
-                // Welcome message in remote terminal
-                const ident = result.identity[0..result.identity_len];
-                var buf: [256]u8 = undefined;
-                const welcome = std.fmt.bufPrint(&buf, "\x1b[1;32mConnected to node {d} ({s})\x1b[0m\r\n\x1b[1;33mmk>\x1b[0m ", .{ result.node_id, ident }) catch "";
-                rt.write(welcome);
+                if (win_idx) |wi| {
+                    // Welcome message
+                    var buf: [256]u8 = undefined;
+                    const welcome = std.fmt.bufPrint(&buf, "\x1b[1;32mConnected to node {d} ({s})\x1b[0m\r\n", .{ result.node_id, ident }) catch "";
+                    rt.write(welcome);
+
+                    // Focus the new window
+                    win_mgr.focused = wi;
+                    term.focused = false;
+                }
 
                 // Notify local terminal
                 const node = nodes.nodes[result.slot];
                 var nbuf: [256]u8 = undefined;
-                const notify = std.fmt.bufPrint(&nbuf, "\x1b[1;32mMounted {s} — shell=0x{x} console=0x{x}\x1b[0m\r\n", .{
-                    ident, node.shell_actor_id, node.console_remote_id,
+                const notify = std.fmt.bufPrint(&nbuf, "\x1b[1;32mMounted {s} — console=0x{x}\x1b[0m\r\n", .{
+                    ident, node.console_remote_id,
                 }) catch "";
                 term.write(notify);
             } else {
@@ -129,13 +108,23 @@ pub fn main() !void {
             const idx = routed.node_idx;
             const node = &nodes.nodes[idx];
 
-            // MSG_CONSOLE_WRITE to our console actor → write to remote terminal
             if (routed.msg.dest == node.console_actor_id and
                 routed.msg.msg_type == bridge_mod.MSG.CONSOLE_WRITE)
             {
-                if (remote_terms[idx]) |rt| {
-                    if (routed.msg.payload.len > 0) {
-                        rt.write(routed.msg.payload);
+                // Find the terminal window for this node
+                for (&win_mgr.windows) |*w| {
+                    if (!w.active) continue;
+                    switch (w.kind) {
+                        .remote => |ni| {
+                            if (ni == idx) {
+                                if (w.term) |t| {
+                                    if (routed.msg.payload.len > 0) {
+                                        t.write(routed.msg.payload);
+                                    }
+                                }
+                            }
+                        },
+                        else => {},
                     }
                 }
             }
@@ -164,151 +153,116 @@ pub fn main() !void {
             }
         }
 
-        // --- Terminal geometry ---
-        const term_tex_w: f32 = @floatFromInt(term.render_tex.texture.width);
-        const term_tex_h: f32 = @floatFromInt(term.render_tex.texture.height);
-        const term_content_y = term_wy + TITLE_BAR_H;
-        const term_total_h = TITLE_BAR_H + term_tex_h;
-
-        // --- Hit testing ---
+        // --- Input ---
         const mouse = rl.c.GetMousePosition();
+        const hit = win_mgr.hitTest(mouse.x, mouse.y);
 
-        const mouse_over_term_title = term.visible and
-            mouse.x >= term_wx and mouse.x < term_wx + term_tex_w and
-            mouse.y >= term_wy and mouse.y < term_content_y;
-
-        const mouse_over_term_content = term.visible and
-            mouse.x >= term_wx and mouse.x < term_wx + term_tex_w and
-            mouse.y >= term_content_y and mouse.y < term_content_y + term_tex_h;
-
-        const mouse_over_term_resize = term.visible and
-            mouse.x >= term_wx + term_tex_w - RESIZE_GRIP and mouse.x < term_wx + term_tex_w + RESIZE_GRIP and
-            mouse.y >= term_wy + term_total_h - RESIZE_GRIP and mouse.y < term_wy + term_total_h + RESIZE_GRIP;
-
-        const mouse_over_term_any = mouse_over_term_title or mouse_over_term_content or mouse_over_term_resize;
-
-        // Set cursor shape for resize grip
-        if (mouse_over_term_resize and drag_target == .none) {
-            rl.c.SetMouseCursor(rl.c.MOUSE_CURSOR_RESIZE_NWSE);
-        } else if (drag_target == .term_resize) {
+        // Resize cursor
+        if (hit) |h| {
+            if (h.zone == .resize and win_mgr.drag_target == .none) {
+                rl.c.SetMouseCursor(rl.c.MOUSE_CURSOR_RESIZE_NWSE);
+            } else {
+                rl.c.SetMouseCursor(rl.c.MOUSE_CURSOR_DEFAULT);
+            }
+        } else if (win_mgr.drag_target == .resize) {
             rl.c.SetMouseCursor(rl.c.MOUSE_CURSOR_RESIZE_NWSE);
         } else {
             rl.c.SetMouseCursor(rl.c.MOUSE_CURSOR_DEFAULT);
         }
 
-        // --- Input ---
-        if (rl.isKeyPressed(rl.c.KEY_F11)) {
-            rl.c.ToggleBorderlessWindowed();
-        }
+        if (rl.isKeyPressed(rl.c.KEY_F11)) rl.c.ToggleBorderlessWindowed();
 
-        // Backtick: toggle terminal visibility
+        // Backtick: toggle local terminal
         if (rl.isKeyPressed(rl.c.KEY_GRAVE)) {
             term.visible = !term.visible;
             if (term.visible) {
-                term.focused = true;
+                win_mgr.focused = local_win;
+                win_mgr.bringToFront(local_win);
                 focused_display = null;
-            } else {
-                term.focused = false;
             }
         }
 
-        // --- Mouse click handling ---
+        // --- Mouse click ---
         if (rl.c.IsMouseButtonPressed(rl.c.MOUSE_BUTTON_LEFT)) {
-            // Check display close button first
+            // Display close button
             if (js.display_mgr.hitTestCloseBtn(mouse.x, mouse.y)) |idx| {
                 js.display_mgr.displays[idx].active = false;
                 js.c_flags[1] = 1;
-                if (focused_display) |fd| {
-                    if (fd == idx) {
-                        focused_display = null;
-                        term.focused = true;
-                    }
+                focused_display = null;
+                win_mgr.focused = local_win;
+            }
+            // Terminal windows (unified)
+            else if (hit) |h| {
+                win_mgr.focused = h.idx;
+                win_mgr.bringToFront(h.idx);
+                focused_display = null;
+
+                // Update Terminal.focused flags
+                for (&win_mgr.windows, 0..) |*w, i| {
+                    if (w.term) |t| t.focused = (i == h.idx);
+                }
+
+                switch (h.zone) {
+                    .title => {
+                        win_mgr.drag_target = .title;
+                        win_mgr.drag_window = h.idx;
+                        win_mgr.drag_offset_x = mouse.x - win_mgr.windows[h.idx].x;
+                        win_mgr.drag_offset_y = mouse.y - win_mgr.windows[h.idx].y;
+                    },
+                    .resize => {
+                        win_mgr.drag_target = .resize;
+                        win_mgr.drag_window = h.idx;
+                        const t = win_mgr.windows[h.idx].term orelse unreachable;
+                        win_mgr.resize_start_w = @floatFromInt(t.render_tex.texture.width);
+                        win_mgr.resize_start_h = @floatFromInt(t.render_tex.texture.height);
+                        win_mgr.resize_start_mx = mouse.x;
+                        win_mgr.resize_start_my = mouse.y;
+                    },
+                    .content => {},
                 }
             }
-            // Remote terminal (title bar or content)
-            else if (hitTestRemoteTermTitle(remote_terms, &remote_term_x, &remote_term_y, mouse)) |idx| {
-                drag_target = .remote_term_title;
-                drag_remote_idx = idx;
-                drag_offset_x = mouse.x - remote_term_x[idx];
-                drag_offset_y = mouse.y - remote_term_y[idx];
-                term.focused = false;
-                focused_display = null;
-                remote_term_focused = idx;
-            }
-            else if (hitTestRemoteTermContent(remote_terms, &remote_term_x, &remote_term_y, mouse)) |idx| {
-                term.focused = false;
-                focused_display = null;
-                remote_term_focused = idx;
-            }
-            // Terminal resize grip
-            else if (mouse_over_term_resize) {
-                drag_target = .term_resize;
-                resize_start_w = term_tex_w;
-                resize_start_h = term_tex_h;
-                resize_start_mx = mouse.x;
-                resize_start_my = mouse.y;
-                term.focused = true;
-                focused_display = null;
-                remote_term_focused = null;
-            }
-            // Terminal title bar → drag
-            else if (mouse_over_term_title) {
-                drag_target = .term_title;
-                drag_offset_x = mouse.x - term_wx;
-                drag_offset_y = mouse.y - term_wy;
-                term.focused = true;
-                focused_display = null;
-                remote_term_focused = null;
-            }
-            // Terminal content → focus
-            else if (mouse_over_term_content) {
-                term.focused = true;
-                focused_display = null;
-                remote_term_focused = null;
-            }
-            // Display title bar → drag
+            // Display windows
             else if (js.display_mgr.hitTestTitleBar(mouse.x, mouse.y)) |idx| {
                 js.display_mgr.dragging = @intCast(idx);
                 js.display_mgr.drag_offset_x = mouse.x - js.display_mgr.displays[idx].screen_x;
                 js.display_mgr.drag_offset_y = mouse.y - js.display_mgr.displays[idx].screen_y;
                 js.display_mgr.bringToFront(@intCast(idx));
                 focused_display = idx;
-                term.focused = false;
-                remote_term_focused = null;
-                drag_target = .display;
-            }
-            // Display content → focus
-            else if (js.display_mgr.hitTestContent(mouse.x, mouse.y)) |idx| {
+                win_mgr.focused = null;
+                for (&win_mgr.windows) |*w| if (w.term) |t| { t.focused = false; };
+                win_mgr.drag_target = .display;
+            } else if (js.display_mgr.hitTestContent(mouse.x, mouse.y)) |idx| {
                 js.display_mgr.bringToFront(@intCast(idx));
                 focused_display = idx;
-                term.focused = false;
-                remote_term_focused = null;
+                win_mgr.focused = null;
+                for (&win_mgr.windows) |*w| if (w.term) |t| { t.focused = false; };
             }
-            // Empty space → focus terminal
+            // Empty space → focus local terminal
             else {
-                term.focused = true;
+                win_mgr.focused = local_win;
+                win_mgr.bringToFront(local_win);
                 focused_display = null;
-                remote_term_focused = null;
+                for (&win_mgr.windows, 0..) |*w, i| {
+                    if (w.term) |t| t.focused = (i == local_win);
+                }
             }
         }
 
         // Drag update
         if (rl.c.IsMouseButtonDown(rl.c.MOUSE_BUTTON_LEFT)) {
-            switch (drag_target) {
-                .term_title => {
-                    term_wx = mouse.x - drag_offset_x;
-                    term_wy = mouse.y - drag_offset_y;
+            switch (win_mgr.drag_target) {
+                .title => {
+                    win_mgr.windows[win_mgr.drag_window].x = mouse.x - win_mgr.drag_offset_x;
+                    win_mgr.windows[win_mgr.drag_window].y = mouse.y - win_mgr.drag_offset_y;
                 },
-                .term_resize => {
-                    const new_w = resize_start_w + (mouse.x - resize_start_mx);
-                    const new_h = resize_start_h + (mouse.y - resize_start_my);
-                    const new_cols: u16 = @intFromFloat(@max(10, new_w / term.cell_w));
-                    const new_rows: u16 = @intFromFloat(@max(4, new_h / term.cell_h));
-                    term.resize(new_cols, new_rows);
-                },
-                .remote_term_title => {
-                    remote_term_x[drag_remote_idx] = mouse.x - drag_offset_x;
-                    remote_term_y[drag_remote_idx] = mouse.y - drag_offset_y;
+                .resize => {
+                    const new_w = win_mgr.resize_start_w + (mouse.x - win_mgr.resize_start_mx);
+                    const new_h = win_mgr.resize_start_h + (mouse.y - win_mgr.resize_start_my);
+                    if (win_mgr.windows[win_mgr.drag_window].term) |t| {
+                        const new_cols: u16 = @intFromFloat(@max(10, new_w / t.cell_w));
+                        const new_rows: u16 = @intFromFloat(@max(4, new_h / t.cell_h));
+                        t.resize(new_cols, new_rows);
+                    }
                 },
                 .display => {
                     if (js.display_mgr.dragging) |drag_id| {
@@ -320,72 +274,70 @@ pub fn main() !void {
             }
         }
 
-        // Drag end
         if (rl.c.IsMouseButtonReleased(rl.c.MOUSE_BUTTON_LEFT)) {
-            drag_target = .none;
+            win_mgr.drag_target = .none;
             js.display_mgr.dragging = null;
         }
 
         // --- Keyboard routing ---
-        if (remote_term_focused) |rf_idx| {
-            // Remote terminal has focus — capture input, send to remote shell
-            if (remote_terms[rf_idx]) |rt| {
-                // Typed characters
-                while (true) {
-                    const ch = rl.c.GetCharPressed();
-                    if (ch == 0) break;
-                    if (ch >= 32 and ch < 127 and remote_input_len < remote_input_buf.len - 1) {
-                        remote_input_buf[remote_input_len] = @intCast(ch);
-                        remote_input_len += 1;
-                        var echo: [1]u8 = .{@intCast(ch)};
-                        rt.write(&echo);
+        if (win_mgr.focused) |fi| {
+            const w = &win_mgr.windows[fi];
+            switch (w.kind) {
+                .local => {
+                    // Local terminal — keyboard goes to JS runtime
+                    if (rl.c.IsKeyDown(rl.c.KEY_LEFT_CONTROL) or rl.c.IsKeyDown(rl.c.KEY_RIGHT_CONTROL)) {
+                        if (rl.isKeyPressed(rl.c.KEY_C)) js.c_flags[1] = 1;
                     }
-                }
+                    term.handleInputNoScroll();
+                    term.update(rl.getFrameTime());
+                },
+                .remote => |node_idx| {
+                    // Remote terminal — keyboard sends to remote shell
+                    if (w.term) |t| {
+                        // Typed characters
+                        while (true) {
+                            const ch = rl.c.GetCharPressed();
+                            if (ch == 0) break;
+                            if (ch >= 32 and ch < 127 and w.input_len < w.input_buf.len - 1) {
+                                w.input_buf[w.input_len] = @intCast(ch);
+                                w.input_len += 1;
+                                var echo: [1]u8 = .{@intCast(ch)};
+                                t.write(&echo);
+                            }
+                        }
 
-                // Enter → send line to remote console (which forwards to shell)
-                if (rl.isKeyPressed(rl.c.KEY_ENTER)) {
-                    rt.write("\r\n");
-                    const node = &nodes.nodes[rf_idx];
-                    if (node.console_remote_id != 0) {
-                        // MSG_SHELL_INPUT = 100, sent to console which forwards to shell
-                        nodes.sendTo(@intCast(rf_idx), node.console_remote_id, 100, remote_input_buf[0..remote_input_len]);
+                        if (rl.isKeyPressed(rl.c.KEY_ENTER)) {
+                            t.write("\r\n");
+                            const node = &nodes.nodes[node_idx];
+                            if (node.console_remote_id != 0) {
+                                nodes.sendTo(node_idx, node.console_remote_id, 100, w.input_buf[0..w.input_len]);
+                            }
+                            w.input_len = 0;
+                        }
+
+                        if (rl.isKeyPressed(rl.c.KEY_BACKSPACE) or rl.c.IsKeyPressedRepeat(rl.c.KEY_BACKSPACE)) {
+                            if (w.input_len > 0) {
+                                w.input_len -= 1;
+                                t.write("\x08 \x08");
+                            }
+                        }
+
+                        t.update(rl.getFrameTime());
                     }
-                    remote_input_len = 0;
-                }
-
-                // Backspace
-                if (rl.isKeyPressed(rl.c.KEY_BACKSPACE) or rl.c.IsKeyPressedRepeat(rl.c.KEY_BACKSPACE)) {
-                    if (remote_input_len > 0) {
-                        remote_input_len -= 1;
-                        rt.write("\x08 \x08");
-                    }
-                }
-
-                rt.update(rl.getFrameTime());
+                },
             }
-        } else if (term.focused) {
-            if (rl.c.IsKeyDown(rl.c.KEY_LEFT_CONTROL) or rl.c.IsKeyDown(rl.c.KEY_RIGHT_CONTROL)) {
-                if (rl.isKeyPressed(rl.c.KEY_C)) {
-                    js.c_flags[1] = 1;
-                }
-            }
-            term.handleInputNoScroll();
-            term.update(rl.getFrameTime());
         } else {
             perf.handleInput();
         }
 
-        // Scroll goes to terminal whenever mouse is over it
-        if (mouse_over_term_any) {
-            term.handleScroll();
+        // Scroll — goes to whatever window the mouse is over
+        if (win_mgr.mouseOverAny(mouse.x, mouse.y)) |wi| {
+            if (win_mgr.windows[wi].term) |t| t.handleScroll();
         }
 
         // --- Render ---
         perf.lapStart();
-        term.render();
-        for (remote_terms) |maybe_rt| {
-            if (maybe_rt) |rt| rt.render();
-        }
+        win_mgr.renderTextures();
         perf.lapEnd(perf_mod.TERM);
 
         rl.beginDrawing();
@@ -394,21 +346,8 @@ pub fn main() !void {
         js.display_mgr.processAndRender();
 
         perf.lapStart();
-        // Display windows
         js.display_mgr.drawAll(focused_display);
-        // Local terminal
-        drawTerminal(&term, term_wx, term_wy, "Terminal", term.focused);
-        // Remote terminals
-        for (remote_terms, 0..) |maybe_rt, i| {
-            if (maybe_rt) |rt| {
-                var title_buf: [48:0]u8 = .{0} ** 48;
-                const node = nodes.nodes[i];
-                const tl = std.fmt.bufPrint(&title_buf, "{s}", .{node.identity[0..node.identity_len]}) catch "";
-                title_buf[tl.len] = 0;
-                const is_focused = if (remote_term_focused) |rf| rf == i else false;
-                drawTerminal(rt, remote_term_x[i], remote_term_y[i], &title_buf, is_focused);
-            }
-        }
+        win_mgr.renderAll();
         perf.lapEnd(perf_mod.DISPLAY);
 
         perf.endFrame();
@@ -418,82 +357,6 @@ pub fn main() !void {
 
         rl.endDrawing();
     }
-
-    // Cleanup remote terminals
-    for (&remote_terms) |*maybe_rt| {
-        if (maybe_rt.*) |rt| {
-            rt.deinit();
-            allocator.destroy(rt);
-            maybe_rt.* = null;
-        }
-    }
-}
-
-fn drawTerminal(t: *const terminal_mod.Terminal, wx: f32, wy: f32, title: [*:0]const u8, focused: bool) void {
-    if (!t.visible) return;
-
-    const tw: f32 = @floatFromInt(t.render_tex.texture.width);
-    const th: f32 = @floatFromInt(t.render_tex.texture.height);
-    const cy = wy + TITLE_BAR_H;
-
-    const title_color = if (focused) rl.color(0, 120, 90, 240) else rl.color(0, 80, 60, 220);
-    rl.c.DrawRectangleV(.{ .x = wx, .y = wy }, .{ .x = tw, .y = TITLE_BAR_H }, title_color);
-    rl.c.DrawText(title, @intFromFloat(wx + 6), @intFromFloat(wy + 4), 14, rl.color(0, 255, 180, 220));
-
-    t.draw(wx, cy);
-
-    const border_color = if (focused) rl.color(0, 255, 180, 220) else rl.color(0, 255, 180, 80);
-    rl.c.DrawRectangleLinesEx(.{ .x = wx, .y = wy, .width = tw, .height = TITLE_BAR_H + th }, 1, border_color);
-
-    // Resize grip
-    const gx = wx + tw;
-    const gy = wy + TITLE_BAR_H + th;
-    rl.c.DrawTriangle(
-        .{ .x = gx, .y = gy - 12 },
-        .{ .x = gx, .y = gy },
-        .{ .x = gx - 12, .y = gy },
-        rl.color(0, 255, 180, 100),
-    );
-}
-
-fn hitTestRemoteTermTitle(
-    terms: [node_mod.MAX_NODES]?*terminal_mod.Terminal,
-    xs: *const [node_mod.MAX_NODES]f32,
-    ys: *const [node_mod.MAX_NODES]f32,
-    mouse: rl.c.Vector2,
-) ?usize {
-    for (terms, 0..) |maybe_rt, i| {
-        const rt = maybe_rt orelse continue;
-        if (!rt.visible) continue;
-        const tw: f32 = @floatFromInt(rt.render_tex.texture.width);
-        if (mouse.x >= xs[i] and mouse.x < xs[i] + tw and
-            mouse.y >= ys[i] and mouse.y < ys[i] + TITLE_BAR_H)
-        {
-            return i;
-        }
-    }
-    return null;
-}
-
-fn hitTestRemoteTermContent(
-    terms: [node_mod.MAX_NODES]?*terminal_mod.Terminal,
-    xs: *const [node_mod.MAX_NODES]f32,
-    ys: *const [node_mod.MAX_NODES]f32,
-    mouse: rl.c.Vector2,
-) ?usize {
-    for (terms, 0..) |maybe_rt, i| {
-        const rt = maybe_rt orelse continue;
-        if (!rt.visible) continue;
-        const tw: f32 = @floatFromInt(rt.render_tex.texture.width);
-        const th: f32 = @floatFromInt(rt.render_tex.texture.height);
-        const cy = ys[i] + TITLE_BAR_H;
-        if (mouse.x >= xs[i] and mouse.x < xs[i] + tw and
-            mouse.y >= cy and mouse.y < cy + th)
-        {
-            return i;
-        }
-    }
-    return null;
 }
 
 fn findScript(name: []const u8, buf: *[512]u8) ?[]const u8 {
