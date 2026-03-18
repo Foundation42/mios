@@ -54,8 +54,10 @@ pub fn serialize(alloc: std.mem.Allocator, msg: Message, mode: Mode) ![]u8 {
 /// Deserialize a wire header from bytes. Returns null if buffer too small.
 pub fn deserializeHeader(buf: []const u8, mode: Mode) ?WireHeader {
     if (buf.len < WIRE_HEADER_SIZE) return null;
-    const ptr: *const WireHeader = @ptrCast(@alignCast(buf.ptr));
-    var hdr = ptr.*;
+    // Copy to aligned storage to avoid alignment issues
+    var hdr: WireHeader = undefined;
+    const dst: *[WIRE_HEADER_SIZE]u8 = @ptrCast(&hdr);
+    @memcpy(dst, buf[0..WIRE_HEADER_SIZE]);
 
     if (mode == .network) {
         hdr.source = @byteSwap(hdr.source);
