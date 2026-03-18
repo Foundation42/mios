@@ -292,6 +292,18 @@ pub const NodeManager = struct {
         // Register our actors on the remote
         self.registerActors(node, console_id, display_id);
 
+        // Subscribe to remote console output — tells the console actor
+        // to forward all stdout output to our mios-console actor
+        if (node.console_remote_id != 0) {
+            const cid_bytes: [8]u8 = @bitCast(console_id);
+            _ = node.conn.send(self.alloc, .{
+                .source = console_id,
+                .dest = node.console_remote_id,
+                .msg_type = bridge.MSG.CONSOLE_SUBSCRIBE,
+                .payload = &cid_bytes,
+            });
+        }
+
         self.pushMountResult(.{
             .slot = slot,
             .success = true,

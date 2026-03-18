@@ -404,6 +404,7 @@ pub const MSG = struct {
     // Console
     pub const CONSOLE_WRITE: u32 = 0xFF000060;
     pub const CONSOLE_CLEAR: u32 = 0xFF000061;
+    pub const CONSOLE_SUBSCRIBE: u32 = 0xFF000062;
 
     // Display
     pub const DISPLAY_DRAW: u32 = 0xFF000051;
