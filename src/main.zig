@@ -252,16 +252,16 @@ pub fn main() !void {
                 }
             }
 
-            // Keyboard always goes to terminal when focused
             term.handleInputNoScroll();
-            // Scroll only when mouse is over the terminal window
-            if (mouse_over_term_any) {
-                term.handleScroll();
-            }
             term.update(rl.getFrameTime());
         } else {
             // No terminal focus — perf toggle
             perf.handleInput();
+        }
+
+        // Scroll goes to terminal whenever mouse is over it, regardless of focus
+        if (mouse_over_term_any) {
+            term.handleScroll();
         }
 
         // --- Render ---
@@ -272,48 +272,21 @@ pub fn main() !void {
         rl.beginDrawing();
         rl.clearBackground(constants.BG_COLOR);
 
-        // Display windows (JS gfx API)
-        perf.lapStart();
+        // Process gfx commands (must happen before drawing)
         js.display_mgr.processAndRender();
-        js.display_mgr.drawAll(focused_display);
-        perf.lapEnd(perf_mod.DISPLAY);
 
-        // Terminal with chrome
+        // Draw in z-order: unfocused layer first, focused layer on top
         perf.lapStart();
-        if (term.visible) {
-            const tw = @as(f32, @floatFromInt(term.render_tex.texture.width));
-            const th = @as(f32, @floatFromInt(term.render_tex.texture.height));
-
-            // Title bar
-            const title_color = if (term.focused) rl.color(0, 120, 90, 240) else rl.color(0, 80, 60, 220);
-            rl.c.DrawRectangleV(
-                .{ .x = term_wx, .y = term_wy },
-                .{ .x = tw, .y = TITLE_BAR_H },
-                title_color,
-            );
-            rl.c.DrawText("Terminal", @intFromFloat(term_wx + 6), @intFromFloat(term_wy + 4), 14, rl.color(0, 255, 180, 220));
-
-            // Terminal content
-            term.draw(term_wx, term_content_y);
-
-            // Border
-            const border_color = if (term.focused) rl.color(0, 255, 180, 220) else rl.color(0, 255, 180, 80);
-            rl.c.DrawRectangleLinesEx(
-                .{ .x = term_wx, .y = term_wy, .width = tw, .height = TITLE_BAR_H + th },
-                1,
-                border_color,
-            );
-
-            // Resize grip (bottom-right corner triangle)
-            const gx = term_wx + tw;
-            const gy = term_wy + TITLE_BAR_H + th;
-            rl.c.DrawTriangle(
-                .{ .x = gx, .y = gy - 12 },
-                .{ .x = gx, .y = gy },
-                .{ .x = gx - 12, .y = gy },
-                rl.color(0, 255, 180, 100),
-            );
+        if (term.focused) {
+            // Display windows behind, terminal on top
+            js.display_mgr.drawAll(focused_display);
+            drawTerminal(&term, term_wx, term_wy, true);
+        } else {
+            // Terminal behind, display windows on top
+            drawTerminal(&term, term_wx, term_wy, false);
+            js.display_mgr.drawAll(focused_display);
         }
+        perf.lapEnd(perf_mod.DISPLAY);
 
         perf.endFrame();
         perf.draw(font, sw, sh);
@@ -322,6 +295,36 @@ pub fn main() !void {
 
         rl.endDrawing();
     }
+}
+
+fn drawTerminal(term: *const terminal_mod.Terminal, wx: f32, wy: f32, focused: bool) void {
+    if (!term.visible) return;
+
+    const tw: f32 = @floatFromInt(term.render_tex.texture.width);
+    const th: f32 = @floatFromInt(term.render_tex.texture.height);
+    const cy = wy + TITLE_BAR_H;
+
+    // Title bar
+    const title_color = if (focused) rl.color(0, 120, 90, 240) else rl.color(0, 80, 60, 220);
+    rl.c.DrawRectangleV(.{ .x = wx, .y = wy }, .{ .x = tw, .y = TITLE_BAR_H }, title_color);
+    rl.c.DrawText("Terminal", @intFromFloat(wx + 6), @intFromFloat(wy + 4), 14, rl.color(0, 255, 180, 220));
+
+    // Content
+    term.draw(wx, cy);
+
+    // Border
+    const border_color = if (focused) rl.color(0, 255, 180, 220) else rl.color(0, 255, 180, 80);
+    rl.c.DrawRectangleLinesEx(.{ .x = wx, .y = wy, .width = tw, .height = TITLE_BAR_H + th }, 1, border_color);
+
+    // Resize grip
+    const gx = wx + tw;
+    const gy = wy + TITLE_BAR_H + th;
+    rl.c.DrawTriangle(
+        .{ .x = gx, .y = gy - 12 },
+        .{ .x = gx, .y = gy },
+        .{ .x = gx - 12, .y = gy },
+        rl.color(0, 255, 180, 100),
+    );
 }
 
 fn findScript(name: []const u8, buf: *[512]u8) ?[]const u8 {
