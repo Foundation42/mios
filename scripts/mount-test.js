@@ -19,31 +19,20 @@ if (!result || result === false) {
     print("Node ID: " + result.nodeId + ", Identity: " + result.identity);
     term.reset();
 
-    // Send a shell command to the microkernel!
-    // MSG_SHELL_INPUT (100) goes to the "shell" WASM actor
-    // It's like typing into the mk-shell terminal
+    // Send MSG_CONSOLE_WRITE to the console actor
+    // This writes directly to mk-shell's stdout
     print("");
     term.color("yellow");
-    print("Sending shell command: echo Hello from MiOS!");
+    print("Sending to console...");
     term.reset();
 
-    actor.send("shell", 100, "echo Hello from MiOS!");
-
-    // Wait and check for any response
-    sleep(500);
-    let msg = actor.recv();
-    let count = 0;
-    while (msg) {
-        term.color("green");
-        print("Recv: type=0x" + msg.type.toString(16) + " payload=\"" + msg.payload + "\"");
-        term.reset();
-        count++;
-        msg = actor.recv();
-    }
+    actor.send("console", 0xFF000060, "\n--- Message from MiOS ---\n");
+    actor.send("console", 0xFF000060, "Hello from MiOS! The GUI shell is connected.\n");
+    actor.send("console", 0xFF000060, "--- End of message ---\n\n");
 
     print("");
     term.color("cyan");
-    print("Check mk-shell terminal for output!");
+    print("Check the mk-shell terminal!");
     print("Bridge is live. Connected: " + actor.connected());
     term.reset();
 }
