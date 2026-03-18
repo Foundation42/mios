@@ -11,7 +11,7 @@ const bridge_mod = @import("bridge.zig");
 const TITLE_BAR_H = display_mod.TITLE_BAR_H;
 const RESIZE_GRIP: f32 = 6; // edge zone for resize
 
-const DragTarget = enum { none, term_title, term_resize, display };
+const DragTarget = enum { none, term_title, term_resize, display, remote_term_title };
 
 pub fn main() !void {
     // --- Raylib init ---
@@ -67,6 +67,7 @@ pub fn main() !void {
     var resize_start_h: f32 = 0;
     var resize_start_mx: f32 = 0;
     var resize_start_my: f32 = 0;
+    var drag_remote_idx: usize = 0;
 
     // Expose node manager to JS runtime so JS can request mounts
     js.node_mgr = &nodes;
@@ -239,6 +240,15 @@ pub fn main() !void {
                 term.focused = true;
                 focused_display = null;
             }
+            // Remote terminal title bar → drag
+            else if (hitTestRemoteTermTitle(remote_terms, &remote_term_x, &remote_term_y, mouse)) |idx| {
+                drag_target = .remote_term_title;
+                drag_remote_idx = idx;
+                drag_offset_x = mouse.x - remote_term_x[idx];
+                drag_offset_y = mouse.y - remote_term_y[idx];
+                term.focused = false;
+                focused_display = null;
+            }
             // Display title bar → drag
             else if (js.display_mgr.hitTestTitleBar(mouse.x, mouse.y)) |idx| {
                 js.display_mgr.dragging = @intCast(idx);
@@ -275,6 +285,10 @@ pub fn main() !void {
                     const new_cols: u16 = @intFromFloat(@max(10, new_w / term.cell_w));
                     const new_rows: u16 = @intFromFloat(@max(4, new_h / term.cell_h));
                     term.resize(new_cols, new_rows);
+                },
+                .remote_term_title => {
+                    remote_term_x[drag_remote_idx] = mouse.x - drag_offset_x;
+                    remote_term_y[drag_remote_idx] = mouse.y - drag_offset_y;
                 },
                 .display => {
                     if (js.display_mgr.dragging) |drag_id| {
@@ -383,6 +397,25 @@ fn drawTerminal(t: *const terminal_mod.Terminal, wx: f32, wy: f32, title: [*:0]c
         .{ .x = gx - 12, .y = gy },
         rl.color(0, 255, 180, 100),
     );
+}
+
+fn hitTestRemoteTermTitle(
+    terms: [node_mod.MAX_NODES]?*terminal_mod.Terminal,
+    xs: *const [node_mod.MAX_NODES]f32,
+    ys: *const [node_mod.MAX_NODES]f32,
+    mouse: rl.c.Vector2,
+) ?usize {
+    for (terms, 0..) |maybe_rt, i| {
+        const rt = maybe_rt orelse continue;
+        if (!rt.visible) continue;
+        const tw: f32 = @floatFromInt(rt.render_tex.texture.width);
+        if (mouse.x >= xs[i] and mouse.x < xs[i] + tw and
+            mouse.y >= ys[i] and mouse.y < ys[i] + TITLE_BAR_H)
+        {
+            return i;
+        }
+    }
+    return null;
 }
 
 fn findScript(name: []const u8, buf: *[512]u8) ?[]const u8 {
