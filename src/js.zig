@@ -1589,6 +1589,13 @@ pub const JsRuntime = struct {
             host, port, result.node_id, result.identity[0..result.identity_len],
         });
 
+        // Give the kernel a moment to send namespace sync, then drain and cache
+        std.time.sleep(100 * std.time.ns_per_ms);
+        const cached = self.drainAndCacheSync();
+        if (cached > 0) {
+            self.pushOutputFmt("\x1b[0;36mCached {d} namespace entries\x1b[0m\r\n", .{cached});
+        }
+
         // Return info object
         const real_ctx = ctx orelse return c.qjs_true();
         const obj = c.JS_NewObject(real_ctx);
@@ -1656,6 +1663,7 @@ pub const JsRuntime = struct {
     }
 
     /// actor.recv() — receive a message (non-blocking). Returns {source, type, payload} or null.
+    /// Auto-caches namespace sync messages (name/path registrations).
     fn jsActorRecv(ctx: ?*c.JSContext, _: c.JSValue, _: c_int, _: [*c]c.JSValue) callconv(.c) c.JSValue {
         const self = getSelf(ctx);
         const real_ctx = ctx orelse return c.qjs_null();
@@ -1665,12 +1673,58 @@ pub const JsRuntime = struct {
         const msg = self.bridge.recv(self.bridge_alloc) orelse return c.qjs_null();
         defer if (msg.payload.len > 0) self.bridge_alloc.free(msg.payload);
 
+        // Auto-cache namespace registrations
+        self.cacheNameSync(msg);
+
         // Return as JS object {source, type, payload}
         const obj = c.JS_NewObject(real_ctx);
         _ = c.JS_SetPropertyStr(real_ctx, obj, "source", c.JS_NewInt64(real_ctx, @bitCast(msg.source)));
         _ = c.JS_SetPropertyStr(real_ctx, obj, "type", c.JS_NewInt64(real_ctx, @intCast(msg.msg_type)));
         _ = c.JS_SetPropertyStr(real_ctx, obj, "payload", c.JS_NewStringLen(real_ctx, msg.payload.ptr, msg.payload.len));
         return obj;
+    }
+
+    /// Drain all pending messages, caching namespace entries. Returns count.
+    fn drainAndCacheSync(self: *JsRuntime) usize {
+        var count: usize = 0;
+        while (self.bridge.recv(self.bridge_alloc)) |msg| {
+            self.cacheNameSync(msg);
+            if (msg.payload.len > 0) self.bridge_alloc.free(msg.payload);
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Cache name/path registration messages into the name cache.
+    fn cacheNameSync(self: *JsRuntime, msg: bridge_mod.Message) void {
+        const is_net = (self.bridge.mode == .network);
+
+        // MSG_NAME_REGISTER: name[64] + actor_id(u64) = 72 bytes
+        if (msg.msg_type == bridge_mod.MSG.NAME_REGISTER and msg.payload.len >= 72) {
+            const name = extractCStr(msg.payload[0..64]);
+            var id_bytes: [8]u8 = undefined;
+            @memcpy(&id_bytes, msg.payload[64..72]);
+            var actor_id: u64 = @bitCast(id_bytes);
+            if (is_net) actor_id = @byteSwap(actor_id);
+            self.name_cache.put(name, actor_id);
+        }
+
+        // MSG_PATH_REGISTER: path[128] + actor_id(u64) = 136 bytes
+        if (msg.msg_type == bridge_mod.MSG.PATH_REGISTER and msg.payload.len >= 136) {
+            const path = extractCStr(msg.payload[0..128]);
+            var id_bytes: [8]u8 = undefined;
+            @memcpy(&id_bytes, msg.payload[128..136]);
+            var actor_id: u64 = @bitCast(id_bytes);
+            if (is_net) actor_id = @byteSwap(actor_id);
+            self.name_cache.put(path, actor_id);
+        }
+    }
+
+    fn extractCStr(buf: []const u8) []const u8 {
+        for (buf, 0..) |ch, i| {
+            if (ch == 0) return buf[0..i];
+        }
+        return buf;
     }
 
     /// actor.connected() — check if connected

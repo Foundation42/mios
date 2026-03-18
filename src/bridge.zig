@@ -395,6 +395,12 @@ pub const MSG = struct {
     pub const NS_LIST: u32 = 0xFF000016;
     pub const NS_REPLY: u32 = 0xFF000019;
 
+    // Cross-node name/path sync
+    pub const NAME_REGISTER: u32 = 0xFF000012;
+    pub const NAME_UNREGISTER: u32 = 0xFF000013;
+    pub const PATH_REGISTER: u32 = 0xFF00001B;
+    pub const PATH_UNREGISTER: u32 = 0xFF00001C;
+
     // Console
     pub const CONSOLE_WRITE: u32 = 0xFF000060;
     pub const CONSOLE_CLEAR: u32 = 0xFF000061;
