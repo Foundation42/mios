@@ -38,6 +38,9 @@ pub fn main() !void {
     var term_x: f32 = 0;
     var term_y: f32 = 0;
 
+    // Which display is focused (null = terminal or nothing)
+    var focused_display: ?usize = null;
+
     while (!rl.windowShouldClose()) {
         const sw = rl.getScreenWidth();
         const sh = rl.getScreenHeight();
@@ -70,32 +73,84 @@ pub fn main() !void {
 
         // --- Hit testing ---
         const mouse = rl.c.GetMousePosition();
-        const mouse_over_term = term.visible and hitTestRect(mouse, term_x, term_y, @floatFromInt(term.render_tex.texture.width), @floatFromInt(term.render_tex.texture.height));
-        const mouse_over_display = hitTestDisplays(&js.display_mgr, mouse);
+        const mouse_over_term = term.visible and hitTestRect(
+            mouse,
+            term_x,
+            term_y,
+            @floatFromInt(term.render_tex.texture.width),
+            @floatFromInt(term.render_tex.texture.height),
+        );
 
-        // --- Focus handling ---
+        // --- Input ---
         // F11: fullscreen toggle (always available)
         if (rl.isKeyPressed(rl.c.KEY_F11)) {
             rl.c.ToggleBorderlessWindowed();
         }
 
-        // Click-to-focus
-        if (rl.c.IsMouseButtonPressed(rl.c.MOUSE_BUTTON_LEFT)) {
-            if (mouse_over_term) {
-                term.focused = true;
-            } else if (mouse_over_display != null) {
-                term.focused = false;
-            }
-            // Click on empty space — keep current focus
-        }
-
         // Backtick: toggle terminal visibility
         if (rl.isKeyPressed(rl.c.KEY_GRAVE)) {
             term.visible = !term.visible;
-            term.focused = term.visible;
+            if (term.visible) {
+                term.focused = true;
+                focused_display = null;
+            } else {
+                term.focused = false;
+            }
         }
 
-        // --- Input routing ---
+        // --- Mouse click handling ---
+        if (rl.c.IsMouseButtonPressed(rl.c.MOUSE_BUTTON_LEFT)) {
+            // Check close button first (topmost window)
+            if (js.display_mgr.hitTestCloseBtn(mouse.x, mouse.y)) |idx| {
+                js.display_mgr.displays[idx].active = false;
+                if (focused_display) |fd| {
+                    if (fd == idx) {
+                        focused_display = null;
+                        term.focused = true;
+                    }
+                }
+            }
+            // Check title bar → start drag
+            else if (js.display_mgr.hitTestTitleBar(mouse.x, mouse.y)) |idx| {
+                js.display_mgr.dragging = @intCast(idx);
+                js.display_mgr.drag_offset_x = mouse.x - js.display_mgr.displays[idx].screen_x;
+                js.display_mgr.drag_offset_y = mouse.y - js.display_mgr.displays[idx].screen_y;
+                js.display_mgr.bringToFront(@intCast(idx));
+                focused_display = idx;
+                term.focused = false;
+            }
+            // Check display content → focus window
+            else if (js.display_mgr.hitTestContent(mouse.x, mouse.y)) |idx| {
+                js.display_mgr.bringToFront(@intCast(idx));
+                focused_display = idx;
+                term.focused = false;
+            }
+            // Check terminal
+            else if (mouse_over_term) {
+                term.focused = true;
+                focused_display = null;
+            }
+            // Click on empty space — focus terminal
+            else {
+                term.focused = true;
+                focused_display = null;
+            }
+        }
+
+        // Drag update
+        if (rl.c.IsMouseButtonDown(rl.c.MOUSE_BUTTON_LEFT)) {
+            if (js.display_mgr.dragging) |drag_id| {
+                js.display_mgr.displays[drag_id].screen_x = mouse.x - js.display_mgr.drag_offset_x;
+                js.display_mgr.displays[drag_id].screen_y = mouse.y - js.display_mgr.drag_offset_y;
+            }
+        }
+
+        // Drag end
+        if (rl.c.IsMouseButtonReleased(rl.c.MOUSE_BUTTON_LEFT)) {
+            js.display_mgr.dragging = null;
+        }
+
+        // --- Keyboard routing ---
         if (term.focused) {
             // Ctrl+C: interrupt running JS program
             if (rl.c.IsKeyDown(rl.c.KEY_LEFT_CONTROL) or rl.c.IsKeyDown(rl.c.KEY_RIGHT_CONTROL)) {
@@ -104,15 +159,15 @@ pub fn main() !void {
                 }
             }
 
-            // Terminal gets keyboard always when focused, scroll only when mouse is over it
+            // Terminal gets keyboard; scroll only when mouse is over it
             if (mouse_over_term) {
-                term.handleInput(); // includes scroll
+                term.handleInput();
             } else {
                 term.handleInputNoScroll();
             }
             term.update(rl.getFrameTime());
         } else {
-            // Terminal not focused — perf toggle available
+            // No terminal focus — perf toggle
             perf.handleInput();
         }
 
@@ -127,7 +182,7 @@ pub fn main() !void {
         // Display windows (JS gfx API)
         perf.lapStart();
         js.display_mgr.processAndRender();
-        js.display_mgr.drawAll();
+        js.display_mgr.drawAll(focused_display);
         perf.lapEnd(perf_mod.DISPLAY);
 
         // Terminal
@@ -156,21 +211,6 @@ pub fn main() !void {
 /// Point-in-rectangle hit test
 fn hitTestRect(p: rl.c.Vector2, x: f32, y: f32, w: f32, h: f32) bool {
     return p.x >= x and p.x < x + w and p.y >= y and p.y < y + h;
-}
-
-/// Check if mouse is over any active display window. Returns display index or null.
-fn hitTestDisplays(mgr: *display_mod.DisplayManager, p: rl.c.Vector2) ?usize {
-    // Check in reverse order (topmost display first)
-    var i: usize = display_mod.MAX_DISPLAYS;
-    while (i > 0) {
-        i -= 1;
-        const d = mgr.displays[i];
-        if (!d.active or !d.has_good_frame) continue;
-        const w: f32 = @floatFromInt(d.width);
-        const h: f32 = @floatFromInt(d.height);
-        if (hitTestRect(p, d.screen_x, d.screen_y, w, h)) return i;
-    }
-    return null;
 }
 
 fn findScript(name: []const u8, buf: *[512]u8) ?[]const u8 {
