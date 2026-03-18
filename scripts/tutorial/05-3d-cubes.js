@@ -1,5 +1,5 @@
 // Tutorial 05 — 3D cubes with multiple behaviors
-exec("../scripts/lib/scene.js");
+exec("scripts/lib/scene.js");
 
 const scene = new Scene(0, 400, 400);
 scene.position(50, 30);

@@ -1,5 +1,5 @@
 // Tutorial 10 — Mesh builder: icosphere from point cloud
-exec("../scripts/lib/mesh.js");
+exec("scripts/lib/mesh.js");
 
 // Generate an icosphere — points on a sphere, properly triangulated
 const sphere = Mesh.icosphere(1.5, 2); // radius 1.5, 2 subdivisions = 320 triangles

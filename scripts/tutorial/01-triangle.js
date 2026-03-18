@@ -1,5 +1,5 @@
 // Tutorial 01 — Hello Triangle
-exec("../scripts/lib/scene.js");
+exec("scripts/lib/scene.js");
 
 const scene = new Scene(0, 400, 400);
 scene.position(50, 30);

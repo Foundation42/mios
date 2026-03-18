@@ -1,5 +1,5 @@
 // Tutorial 09 — Multiple solid cubes with orbiting camera
-exec("../scripts/lib/scene.js");
+exec("scripts/lib/scene.js");
 
 const scene = new Scene(0, 450, 400);
 scene.position(50, 30);

@@ -1,5 +1,5 @@
 // Tutorial 12 — Full viewport meshes, transparent, floating over the map
-exec("../scripts/lib/mesh.js");
+exec("scripts/lib/mesh.js");
 
 const sphere = Mesh.icosphere(1.0, 2);
 const box = Mesh.box(1.5, 1.5, 1.5);
