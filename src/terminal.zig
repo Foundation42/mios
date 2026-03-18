@@ -533,7 +533,14 @@ pub const Terminal = struct {
     // Input handling
     // ---------------------------------------------------------------
 
+    /// Handle all terminal input (keyboard + scroll). Call when mouse is over terminal.
     pub fn handleInput(self: *Terminal) void {
+        self.handleInputNoScroll();
+        self.handleScroll();
+    }
+
+    /// Handle keyboard input only (no scroll). Call when terminal is focused but mouse is elsewhere.
+    pub fn handleInputNoScroll(self: *Terminal) void {
         if (!self.focused) return;
 
         if (self.raw_mode) {
@@ -569,8 +576,10 @@ pub const Terminal = struct {
                 self.write("\x08 \x08");
             }
         }
+    }
 
-        // Mouse wheel → scrollback
+    /// Handle mouse wheel scrollback. Call only when mouse is over the terminal.
+    pub fn handleScroll(self: *Terminal) void {
         const wheel = rl.getMouseWheelMove();
         if (wheel > 0 and self.scroll_offset < self.scrollback_count) {
             self.scroll_offset += 3;
