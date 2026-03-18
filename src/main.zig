@@ -53,6 +53,9 @@ pub fn main() !void {
     // Display focus (for gfx windows, separate from terminal windows)
     var focused_display: ?usize = null;
 
+    // Remote display slots: node_idx → display_id (one per remote node)
+    var remote_display: [node_mod.MAX_NODES]?u8 = .{null} ** node_mod.MAX_NODES;
+
     while (!rl.windowShouldClose()) {
         const sw = rl.getScreenWidth();
         const sh = rl.getScreenHeight();
@@ -108,10 +111,10 @@ pub fn main() !void {
             const idx = routed.node_idx;
             const node = &nodes.nodes[idx];
 
+            // Console messages → remote terminal
             if (routed.msg.dest == node.console_actor_id and
                 routed.msg.msg_type == bridge_mod.MSG.CONSOLE_WRITE)
             {
-                // Find the terminal window for this node
                 for (&win_mgr.windows) |*w| {
                     if (!w.active) continue;
                     switch (w.kind) {
@@ -127,6 +130,11 @@ pub fn main() !void {
                         else => {},
                     }
                 }
+            }
+
+            // Display messages → gfx display window
+            if (routed.msg.dest == node.display_actor_id) {
+                dispatchDisplayMsg(&js.display_mgr, &remote_display, idx, routed.msg);
             }
         }
 
@@ -358,6 +366,129 @@ pub fn main() !void {
         perf.lapEnd(perf_mod.DRAW);
 
         rl.endDrawing();
+    }
+}
+
+/// Convert RGB565 (16-bit) to RGBA (4 bytes).
+fn rgb565to32(c565: u16) display_mod.Color4 {
+    const r: u8 = @intCast((c565 >> 11) & 0x1F);
+    const g: u8 = @intCast((c565 >> 5) & 0x3F);
+    const b: u8 = @intCast(c565 & 0x1F);
+    return .{
+        .r = (r << 3) | (r >> 2),
+        .g = (g << 2) | (g >> 4),
+        .b = (b << 3) | (b >> 2),
+        .a = 255,
+    };
+}
+
+/// Dispatch a display message from a remote node to a MiOS display window.
+fn dispatchDisplayMsg(
+    mgr: *display_mod.DisplayManager,
+    remote_display: *[node_mod.MAX_NODES]?u8,
+    node_idx: usize,
+    msg: bridge_mod.Message,
+) void {
+    // Auto-create display for this node if needed
+    if (remote_display[node_idx] == null) {
+        // Find a free display slot
+        for (mgr.displays, 0..) |d, i| {
+            if (!d.active) {
+                remote_display[node_idx] = @intCast(i);
+                // Create via command ring
+                var cmd = display_mod.DrawCmd{ .tag = .create };
+                cmd.display_id = @intCast(i);
+                cmd.f[0] = 466; // default size (AMOLED-ish)
+                cmd.f[1] = 466;
+                mgr.ring.push(cmd);
+                // Position it
+                var move_cmd = display_mod.DrawCmd{ .tag = .move_display };
+                move_cmd.display_id = @intCast(i);
+                move_cmd.f[0] = 400 + @as(f32, @floatFromInt(node_idx)) * 30;
+                move_cmd.f[1] = 50;
+                mgr.ring.push(move_cmd);
+                // Set title
+                const d2 = &mgr.displays[i];
+                const title = std.fmt.bufPrint(&d2.title, "Remote Display {d}", .{node_idx}) catch "";
+                d2.title_len = @intCast(title.len);
+                break;
+            }
+        }
+    }
+
+    const disp_id = remote_display[node_idx] orelse return;
+    const payload = msg.payload;
+
+    switch (msg.msg_type) {
+        bridge_mod.MSG.DISPLAY_CLEAR => {
+            var cmd = display_mod.DrawCmd{ .tag = .begin_frame };
+            cmd.display_id = disp_id;
+            mgr.ring.push(cmd);
+            var clear_cmd = display_mod.DrawCmd{ .tag = .clear };
+            clear_cmd.display_id = disp_id;
+            clear_cmd.color = .{ .r = 0, .g = 0, .b = 0, .a = 255 };
+            mgr.ring.push(clear_cmd);
+            var end_cmd = display_mod.DrawCmd{ .tag = .end_frame };
+            end_cmd.display_id = disp_id;
+            mgr.ring.push(end_cmd);
+        },
+
+        bridge_mod.MSG.DISPLAY_FILL => {
+            // Payload: x(2) y(2) w(2) h(2) color(2) pad(2) = 12 bytes
+            if (payload.len >= 10) {
+                const x = std.mem.readInt(u16, payload[0..2], .little);
+                const y = std.mem.readInt(u16, payload[2..4], .little);
+                const w = std.mem.readInt(u16, payload[4..6], .little);
+                const h = std.mem.readInt(u16, payload[6..8], .little);
+                const color = std.mem.readInt(u16, payload[8..10], .little);
+                const c = rgb565to32(color);
+
+                var cmd = display_mod.DrawCmd{ .tag = .begin_frame };
+                cmd.display_id = disp_id;
+                mgr.ring.push(cmd);
+                var rect_cmd = display_mod.DrawCmd{ .tag = .rect };
+                rect_cmd.display_id = disp_id;
+                rect_cmd.f[0] = @floatFromInt(x);
+                rect_cmd.f[1] = @floatFromInt(y);
+                rect_cmd.f[2] = @floatFromInt(w);
+                rect_cmd.f[3] = @floatFromInt(h);
+                rect_cmd.color = c;
+                mgr.ring.push(rect_cmd);
+                var end_cmd = display_mod.DrawCmd{ .tag = .end_frame };
+                end_cmd.display_id = disp_id;
+                mgr.ring.push(end_cmd);
+            }
+        },
+
+        bridge_mod.MSG.DISPLAY_TEXT => {
+            // Payload: x(2) y(2) fg(2) bg(2) text[]
+            if (payload.len >= 8) {
+                const x = std.mem.readInt(u16, payload[0..2], .little);
+                const y = std.mem.readInt(u16, payload[2..4], .little);
+                const fg_565 = std.mem.readInt(u16, payload[4..6], .little);
+                const fg = rgb565to32(fg_565);
+                const text_data = payload[8..];
+
+                var cmd = display_mod.DrawCmd{ .tag = .begin_frame };
+                cmd.display_id = disp_id;
+                mgr.ring.push(cmd);
+                var text_cmd = display_mod.DrawCmd{ .tag = .text };
+                text_cmd.display_id = disp_id;
+                text_cmd.f[0] = @floatFromInt(x);
+                text_cmd.f[1] = @floatFromInt(y);
+                text_cmd.f[2] = 16; // font size
+                text_cmd.color = fg;
+                const copy_len = @min(text_data.len, 64);
+                @memcpy(text_cmd.text_buf[0..copy_len], text_data[0..copy_len]);
+                text_cmd.text_len = @intCast(copy_len);
+                mgr.ring.push(text_cmd);
+                var end_cmd = display_mod.DrawCmd{ .tag = .end_frame };
+                end_cmd.display_id = disp_id;
+                mgr.ring.push(end_cmd);
+            }
+        },
+
+        else => {},
     }
 }
 
