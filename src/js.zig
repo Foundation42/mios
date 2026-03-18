@@ -492,6 +492,7 @@ pub const JsRuntime = struct {
         const actor_obj = c.JS_NewObject(ctx);
         _ = c.JS_SetPropertyStr(ctx, actor_obj, "connect", c.JS_NewCFunction(ctx, jsActorConnect, "connect", 1));
         _ = c.JS_SetPropertyStr(ctx, actor_obj, "connectTcp", c.JS_NewCFunction(ctx, jsActorConnectTcp, "connectTcp", 2));
+        _ = c.JS_SetPropertyStr(ctx, actor_obj, "mount", c.JS_NewCFunction(ctx, jsActorMount, "mount", 2));
         _ = c.JS_SetPropertyStr(ctx, actor_obj, "send", c.JS_NewCFunction(ctx, jsActorSend, "send", 3));
         _ = c.JS_SetPropertyStr(ctx, actor_obj, "recv", c.JS_NewCFunction(ctx, jsActorRecv, "recv", 0));
         _ = c.JS_SetPropertyStr(ctx, actor_obj, "connected", c.JS_NewCFunction(ctx, jsActorConnected, "connected", 0));
@@ -1564,6 +1565,36 @@ pub const JsRuntime = struct {
         };
         self.pushOutputFmt("\x1b[1;32mConnected to {s}:{d}\x1b[0m\r\n", .{ host, port });
         return c.qjs_true();
+    }
+
+    /// actor.mount(host, port) — connect to microkernel with mount handshake
+    fn jsActorMount(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        if (argc < 2) return c.qjs_false();
+        const self = getSelf(ctx);
+        const host_c = c.JS_ToCString(ctx, argv[0]);
+        if (host_c == null) return c.qjs_false();
+        defer c.JS_FreeCString(ctx, host_c);
+        const host = cStrToSlice(host_c);
+
+        var port: i32 = 0;
+        _ = c.JS_ToInt32(ctx, &port, argv[1]);
+
+        self.bridge.close();
+        const result = self.bridge.mount(host, @intCast(@as(u32, @bitCast(port)) & 0xFFFF), 15, "mios") catch {
+            self.pushOutputFmt("\x1b[1;31mactor.mount: failed to connect to {s}:{d}\x1b[0m\r\n", .{ host, port });
+            return c.qjs_false();
+        };
+
+        self.pushOutputFmt("\x1b[1;32mMounted to {s}:{d} — peer node={d} identity=\"{s}\"\x1b[0m\r\n", .{
+            host, port, result.node_id, result.identity[0..result.identity_len],
+        });
+
+        // Return info object
+        const real_ctx = ctx orelse return c.qjs_true();
+        const obj = c.JS_NewObject(real_ctx);
+        _ = c.JS_SetPropertyStr(real_ctx, obj, "nodeId", c.JS_NewInt32(real_ctx, @intCast(result.node_id)));
+        _ = c.JS_SetPropertyStr(real_ctx, obj, "identity", c.JS_NewStringLen(real_ctx, &result.identity, result.identity_len));
+        return obj;
     }
 
     /// actor.send(dest, type, payload) — send a message

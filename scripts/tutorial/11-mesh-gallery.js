@@ -21,8 +21,8 @@ const LIGHT = [0.5, -0.7, 0.5];
 let t = 0;
 while (true) {
     gfx.begin(0);
-    gfx.clear(8, 8, 16);
-    gfx.text(10, 10, "11 - Mesh Gallery", 16, WHITE);
+    // gfx.clear(8, 8, 16);
+    // gfx.text(10, 10, "11 - Mesh Gallery", 16, WHITE);
 
     const camX = Math.cos(t * 0.012) * 8;
     const camZ = Math.sin(t * 0.012) * 8;
@@ -44,7 +44,7 @@ while (true) {
 
     gfx.end3d();
 
-    gfx.text(10, 380, "Frame " + t, 10, gfx.rgb(100, 100, 100));
+    // gfx.text(10, 380, "Frame " + t, 10, gfx.rgb(100, 100, 100));
     gfx.end(0);
     t++;
     sleep(16);

@@ -1,5 +1,13 @@
 const std = @import("std");
 const posix = std.posix;
+const c = @cImport({
+    @cInclude("fcntl.h");
+});
+
+fn setNonBlocking(fd: posix.fd_t) void {
+    const flags = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+    _ = c.fcntl(fd, c.F_SETFL, flags | c.O_NONBLOCK);
+}
 
 /// Microkernel wire format — 28-byte packed header + payload.
 /// Host byte order for Unix sockets, network byte order for TCP.
@@ -69,6 +77,56 @@ pub fn deserializeHeader(buf: []const u8, mode: Mode) ?WireHeader {
 }
 
 // ---------------------------------------------------------------
+// Mount handshake (microkernel protocol)
+// ---------------------------------------------------------------
+
+pub const MOUNT_HELLO_MAGIC: u32 = 0x4D4B3031; // "MK01"
+pub const MOUNT_HELLO_SIZE: usize = 40; // 4 + 4 + 32
+
+pub const MountHello = extern struct {
+    magic: u32,
+    node_id: u32,
+    identity: [32]u8,
+};
+
+pub const MountResult = struct {
+    node_id: u32,
+    identity: [32]u8,
+    identity_len: usize,
+};
+
+/// Helper: blocking TCP connect (returns fd before setting non-blocking).
+fn tcpConnect(host: []const u8, port: u16) !posix.fd_t {
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    errdefer posix.close(fd);
+
+    // Parse host as IPv4 dotted quad
+    var ip4: u32 = 0;
+    var octet: u32 = 0;
+    var shift: u5 = 0;
+    for (host) |ch| {
+        if (ch == '.') {
+            ip4 |= octet << (shift * 8);
+            octet = 0;
+            shift += 1;
+        } else if (ch >= '0' and ch <= '9') {
+            octet = octet * 10 + (ch - '0');
+        }
+    }
+    ip4 |= octet << (shift * 8);
+
+    var addr: posix.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = ip4,
+        .zero = .{0} ** 8,
+    };
+
+    try posix.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in));
+    return fd;
+}
+
+// ---------------------------------------------------------------
 // Connection — non-blocking Unix socket or TCP
 // ---------------------------------------------------------------
 
@@ -109,39 +167,82 @@ pub const Connection = struct {
 
     /// Connect to a TCP host:port (network byte order).
     pub fn connectTcp(self: *Connection, host: []const u8, port: u16) !void {
-        const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.NONBLOCK, 0);
+        const fd = try tcpConnect(host, port);
         errdefer posix.close(fd);
 
-        // Parse host as IPv4 dotted quad
-        var ip4: u32 = 0;
-        var octet: u32 = 0;
-        var shift: u5 = 0;
-        for (host) |ch| {
-            if (ch == '.') {
-                ip4 |= octet << (shift * 8);
-                octet = 0;
-                shift += 1;
-            } else if (ch >= '0' and ch <= '9') {
-                octet = octet * 10 + (ch - '0');
-            }
-        }
-        ip4 |= octet << (shift * 8);
-
-        var addr: posix.sockaddr.in = .{
-            .family = posix.AF.INET,
-            .port = std.mem.nativeToBig(u16, port),
-            .addr = ip4,
-            .zero = .{0} ** 8,
-        };
-
-        posix.connect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in)) catch |err| {
-            if (err != error.WouldBlock) return err;
-        };
+        // Set non-blocking after connect
+        setNonBlocking(fd);
 
         self.fd = fd;
         self.mode = .network;
         self.connected = true;
         self.read_len = 0;
+    }
+
+    /// Mount to a microkernel via TCP with hello handshake.
+    /// This is the standard way to connect to a running microkernel.
+    /// Returns the peer's node_id and identity on success.
+    pub fn mount(self: *Connection, host: []const u8, port: u16, our_node_id: u32, our_identity: []const u8) !MountResult {
+        const fd = try tcpConnect(host, port);
+        errdefer posix.close(fd);
+
+        // Send our hello (blocking)
+        var hello: MountHello = .{
+            .magic = std.mem.nativeToBig(u32, MOUNT_HELLO_MAGIC),
+            .node_id = std.mem.nativeToBig(u32, our_node_id),
+            .identity = .{0} ** 32,
+        };
+        const id_len = @min(our_identity.len, 31);
+        @memcpy(hello.identity[0..id_len], our_identity[0..id_len]);
+
+        const hello_bytes: *const [MOUNT_HELLO_SIZE]u8 = @ptrCast(&hello);
+        var sent: usize = 0;
+        while (sent < MOUNT_HELLO_SIZE) {
+            const n = posix.write(fd, hello_bytes[sent..MOUNT_HELLO_SIZE]) catch return error.ConnectionRefused;
+            if (n == 0) return error.ConnectionRefused;
+            sent += n;
+        }
+
+        // Read peer's hello (blocking)
+        var peer_buf: [MOUNT_HELLO_SIZE]u8 = undefined;
+        var read_n: usize = 0;
+        while (read_n < MOUNT_HELLO_SIZE) {
+            const n = posix.read(fd, peer_buf[read_n..MOUNT_HELLO_SIZE]) catch return error.ConnectionRefused;
+            if (n == 0) return error.ConnectionRefused;
+            read_n += n;
+        }
+
+        var peer: MountHello = undefined;
+        const dst: *[MOUNT_HELLO_SIZE]u8 = @ptrCast(&peer);
+        @memcpy(dst, &peer_buf);
+
+        // Verify magic
+        if (std.mem.nativeToBig(u32, peer.magic) != MOUNT_HELLO_MAGIC) {
+            return error.ConnectionRefused;
+        }
+
+        const peer_node = std.mem.bigToNative(u32, peer.node_id);
+
+        // Set non-blocking for message exchange
+        setNonBlocking(fd);
+
+        self.fd = fd;
+        self.mode = .network;
+        self.connected = true;
+        self.read_len = 0;
+
+        // Find identity length
+        var ident_len: usize = 0;
+        for (peer.identity) |ch| {
+            if (ch == 0) break;
+            ident_len += 1;
+        }
+
+        return .{
+            .node_id = peer_node,
+            .identity = peer.identity,
+            .identity_len = ident_len,
+        };
     }
 
     /// Send a message. Returns true on success.

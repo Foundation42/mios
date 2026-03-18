@@ -18,9 +18,9 @@ for (let i = 0; i < NUM_STARS; i++) {
 let t = 0;
 while (true) {
     gfx.begin(0);
-    gfx.clear(0, 0, 5);
+    gfx.clear(5, 5, 10);
 
-    gfx.text(10, 10, "06 - Starfield", 16, gfx.rgb(200, 200, 200));
+    // gfx.text(10, 10, "06 - Starfield", 16, gfx.rgb(200, 200, 200));
 
     for (const star of stars) {
         star.z -= star.speed;
@@ -40,7 +40,7 @@ while (true) {
         }
     }
 
-    gfx.text(10, 380, NUM_STARS + " stars", 10, gfx.rgb(100, 100, 100));
+    // gfx.text(10, 380, NUM_STARS + " stars", 10, gfx.rgb(100, 100, 100));
     gfx.end(0);
     t++;
     sleep(16);

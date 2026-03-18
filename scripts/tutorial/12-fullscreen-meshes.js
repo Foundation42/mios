@@ -1,4 +1,4 @@
-// Tutorial 12 — Full viewport meshes, transparent, floating over the map
+// Tutorial 12 — Full viewport meshes, transparent
 exec("scripts/lib/mesh.js");
 
 const sphere = Mesh.icosphere(1.0, 2);
@@ -7,7 +7,7 @@ const plane = Mesh.plane(3, 3, 6, 6);
 
 // Full viewport — use gfx.rgb for Raylib screen size query not available,
 // so use a large fixed size
-gfx.create(0, 1920, 1080);
+gfx.create(0, 512, 360);
 gfx.move(0, 0, 0);
 
 const CYAN = gfx.rgb(50, 200, 220);
