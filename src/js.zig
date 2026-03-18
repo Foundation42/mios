@@ -80,10 +80,13 @@ pub const JsRuntime = struct {
     mem_poll_counter: u32 = 0, // worker-only counter to throttle idle mem updates
     qjs_rt: ?*c.JSRuntime = null, // set by worker thread, used for mem stats
 
-    // Microkernel bridge (worker thread only)
+    // Microkernel bridge (worker thread only — legacy, used for direct JS bridge calls)
     bridge: bridge_mod.Connection = .{},
     name_cache: bridge_mod.NameCache = .{},
     bridge_alloc: std.mem.Allocator = std.heap.page_allocator,
+
+    // Node manager (owned by main thread, shared via pointer)
+    node_mgr: ?*@import("node.zig").NodeManager = null,
 
     // MiOS actor IDs (node 15)
     pub const MIOS_NODE: u32 = 15;
@@ -1572,7 +1575,9 @@ pub const JsRuntime = struct {
         return c.qjs_true();
     }
 
-    /// actor.mount(host, port) — connect to microkernel with mount handshake
+    /// actor.mount(host, port) — mount a remote microkernel node.
+    /// Uses the NodeManager (bridge thread) to connect asynchronously.
+    /// A new terminal window will appear on the desktop for this node.
     fn jsActorMount(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
         if (argc < 2) return c.qjs_false();
         const self = getSelf(ctx);
@@ -1584,32 +1589,19 @@ pub const JsRuntime = struct {
         var port: i32 = 0;
         _ = c.JS_ToInt32(ctx, &port, argv[1]);
 
-        self.bridge.close();
-        const result = self.bridge.mount(host, @intCast(@as(u32, @bitCast(port)) & 0xFFFF), 15, "mios") catch {
-            self.pushOutputFmt("\x1b[1;31mactor.mount: failed to connect to {s}:{d}\x1b[0m\r\n", .{ host, port });
+        if (self.node_mgr) |mgr| {
+            const slot = mgr.requestMount(host, @intCast(@as(u32, @bitCast(port)) & 0xFFFF));
+            if (slot) |s| {
+                self.pushOutputFmt("\x1b[0;36mMounting {s}:{d} (slot {d})...\x1b[0m\r\n", .{ host, port, s });
+                return c.qjs_true();
+            } else {
+                self.pushOutputFmt("\x1b[1;31mNo free mount slots\x1b[0m\r\n", .{});
+                return c.qjs_false();
+            }
+        } else {
+            self.pushOutput("\x1b[1;31mNode manager not initialized\x1b[0m\r\n");
             return c.qjs_false();
-        };
-
-        self.pushOutputFmt("\x1b[1;32mMounted to {s}:{d} — peer node={d} identity=\"{s}\"\x1b[0m\r\n", .{
-            host, port, result.node_id, result.identity[0..result.identity_len],
-        });
-
-        // Give the kernel a moment to send namespace sync, then drain and cache
-        std.time.sleep(100 * std.time.ns_per_ms);
-        const cached = self.drainAndCacheSync();
-        if (cached > 0) {
-            self.pushOutputFmt("\x1b[0;36mCached {d} namespace entries\x1b[0m\r\n", .{cached});
         }
-
-        // Register MiOS actors on the remote kernel (reverse mount)
-        self.registerRemoteActors();
-
-        // Return info object
-        const real_ctx = ctx orelse return c.qjs_true();
-        const obj = c.JS_NewObject(real_ctx);
-        _ = c.JS_SetPropertyStr(real_ctx, obj, "nodeId", c.JS_NewInt32(real_ctx, @intCast(result.node_id)));
-        _ = c.JS_SetPropertyStr(real_ctx, obj, "identity", c.JS_NewStringLen(real_ctx, &result.identity, result.identity_len));
-        return obj;
     }
 
     /// actor.send(dest, type, payload) — send a message

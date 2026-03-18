@@ -5,6 +5,8 @@ const terminal_mod = @import("terminal.zig");
 const js_mod = @import("js.zig");
 const perf_mod = @import("perf.zig");
 const display_mod = @import("display.zig");
+const node_mod = @import("node.zig");
+const bridge_mod = @import("bridge.zig");
 
 const TITLE_BAR_H = display_mod.TITLE_BAR_H;
 const RESIZE_GRIP: f32 = 6; // edge zone for resize
@@ -20,6 +22,7 @@ pub fn main() !void {
     rl.c.SetExitKey(0); // ESC is for programs, not quitting
 
     const font = rl.getFontDefault();
+    const allocator = std.heap.page_allocator;
 
     // --- Terminal ---
     var term = terminal_mod.Terminal{};
@@ -33,6 +36,16 @@ pub fn main() !void {
     js.init(&term);
     defer js.deinit();
 
+    // --- Node manager (bridge thread) ---
+    var nodes = node_mod.NodeManager{};
+    nodes.start();
+    defer nodes.stop();
+
+    // Remote terminals (heap-allocated, one per mounted node)
+    var remote_terms: [node_mod.MAX_NODES]?*terminal_mod.Terminal = .{null} ** node_mod.MAX_NODES;
+    var remote_term_x: [node_mod.MAX_NODES]f32 = .{0} ** node_mod.MAX_NODES;
+    var remote_term_y: [node_mod.MAX_NODES]f32 = .{0} ** node_mod.MAX_NODES;
+
     // --- Performance monitor ---
     var perf = perf_mod.PerfTimers{ .js = &js };
 
@@ -43,7 +56,6 @@ pub fn main() !void {
     var term_wx: f32 = 50;
     var term_wy: f32 = 50;
 
-
     // Which display is focused (null = terminal or nothing)
     var focused_display: ?usize = null;
 
@@ -51,19 +63,74 @@ pub fn main() !void {
     var drag_target: DragTarget = .none;
     var drag_offset_x: f32 = 0;
     var drag_offset_y: f32 = 0;
-    // For resize: initial window size and mouse pos at drag start
     var resize_start_w: f32 = 0;
     var resize_start_h: f32 = 0;
     var resize_start_mx: f32 = 0;
     var resize_start_my: f32 = 0;
 
+    // Expose node manager to JS runtime so JS can request mounts
+    js.node_mgr = &nodes;
+
     while (!rl.windowShouldClose()) {
         const sw = rl.getScreenWidth();
         const sh = rl.getScreenHeight();
 
-
         // Drain JS output to terminal
         js.drainOutput();
+
+        // --- Node manager: process mount results ---
+        while (nodes.popMountResult()) |result| {
+            if (result.disconnected) {
+                if (remote_terms[result.slot]) |rt| {
+                    rt.deinit();
+                    allocator.destroy(rt);
+                    remote_terms[result.slot] = null;
+                }
+                term.write("\x1b[1;31mNode disconnected\x1b[0m\r\n");
+            } else if (result.success) {
+                // Create terminal for this remote node
+                const rt = allocator.create(terminal_mod.Terminal) catch continue;
+                rt.* = .{};
+                rt.init(80, 24, 14);
+                rt.visible = true;
+                rt.focused = false;
+                remote_terms[result.slot] = rt;
+
+                const offset: f32 = @floatFromInt(result.slot);
+                remote_term_x[result.slot] = term_wx + 200 + offset * 30;
+                remote_term_y[result.slot] = term_wy + 50 + offset * 30;
+
+                // Welcome message in remote terminal
+                const ident = result.identity[0..result.identity_len];
+                var buf: [256]u8 = undefined;
+                const welcome = std.fmt.bufPrint(&buf, "\x1b[1;32mConnected to node {d} ({s})\x1b[0m\r\n", .{ result.node_id, ident }) catch "";
+                rt.write(welcome);
+
+                // Notify local terminal
+                var nbuf: [256]u8 = undefined;
+                const notify = std.fmt.bufPrint(&nbuf, "\x1b[1;32mMounted {s} — terminal opened\x1b[0m\r\n", .{ident}) catch "";
+                term.write(notify);
+            } else {
+                term.write("\x1b[1;31mMount failed\x1b[0m\r\n");
+            }
+        }
+
+        // --- Node manager: process inbound messages ---
+        while (nodes.inbound.pop()) |routed| {
+            const idx = routed.node_idx;
+            const node = &nodes.nodes[idx];
+
+            // MSG_CONSOLE_WRITE to our console actor → write to remote terminal
+            if (routed.msg.dest == node.console_actor_id and
+                routed.msg.msg_type == bridge_mod.MSG.CONSOLE_WRITE)
+            {
+                if (remote_terms[idx]) |rt| {
+                    if (routed.msg.payload.len > 0) {
+                        rt.write(routed.msg.payload);
+                    }
+                }
+            }
+        }
 
         // Launch shell on first frame
         if (!shell_started) {
@@ -121,7 +188,6 @@ pub fn main() !void {
         }
 
         // --- Input ---
-        // F11: fullscreen toggle (always available)
         if (rl.isKeyPressed(rl.c.KEY_F11)) {
             rl.c.ToggleBorderlessWindowed();
         }
@@ -142,7 +208,6 @@ pub fn main() !void {
             // Check display close button first
             if (js.display_mgr.hitTestCloseBtn(mouse.x, mouse.y)) |idx| {
                 js.display_mgr.displays[idx].active = false;
-                // Interrupt the JS program so it stops rendering to this display
                 js.c_flags[1] = 1;
                 if (focused_display) |fd| {
                     if (fd == idx) {
@@ -184,7 +249,7 @@ pub fn main() !void {
                 term.focused = false;
                 drag_target = .display;
             }
-            // Display content → focus + bring to front
+            // Display content → focus
             else if (js.display_mgr.hitTestContent(mouse.x, mouse.y)) |idx| {
                 js.display_mgr.bringToFront(@intCast(idx));
                 focused_display = idx;
@@ -229,21 +294,18 @@ pub fn main() !void {
 
         // --- Keyboard routing ---
         if (term.focused) {
-            // Ctrl+C: interrupt running JS program
             if (rl.c.IsKeyDown(rl.c.KEY_LEFT_CONTROL) or rl.c.IsKeyDown(rl.c.KEY_RIGHT_CONTROL)) {
                 if (rl.isKeyPressed(rl.c.KEY_C)) {
                     js.c_flags[1] = 1;
                 }
             }
-
             term.handleInputNoScroll();
             term.update(rl.getFrameTime());
         } else {
-            // No terminal focus — perf toggle
             perf.handleInput();
         }
 
-        // Scroll goes to terminal whenever mouse is over it, regardless of focus
+        // Scroll goes to terminal whenever mouse is over it
         if (mouse_over_term_any) {
             term.handleScroll();
         }
@@ -251,24 +313,30 @@ pub fn main() !void {
         // --- Render ---
         perf.lapStart();
         term.render();
+        for (remote_terms) |maybe_rt| {
+            if (maybe_rt) |rt| rt.render();
+        }
         perf.lapEnd(perf_mod.TERM);
 
         rl.beginDrawing();
         rl.clearBackground(constants.BG_COLOR);
 
-        // Process gfx commands (must happen before drawing)
         js.display_mgr.processAndRender();
 
-        // Draw in z-order: unfocused layer first, focused layer on top
         perf.lapStart();
-        if (term.focused) {
-            // Display windows behind, terminal on top
-            js.display_mgr.drawAll(focused_display);
-            drawTerminal(&term, term_wx, term_wy, true);
-        } else {
-            // Terminal behind, display windows on top
-            drawTerminal(&term, term_wx, term_wy, false);
-            js.display_mgr.drawAll(focused_display);
+        // Display windows
+        js.display_mgr.drawAll(focused_display);
+        // Local terminal
+        drawTerminal(&term, term_wx, term_wy, "Terminal", term.focused);
+        // Remote terminals
+        for (remote_terms, 0..) |maybe_rt, i| {
+            if (maybe_rt) |rt| {
+                var title_buf: [48:0]u8 = .{0} ** 48;
+                const node = nodes.nodes[i];
+                const tl = std.fmt.bufPrint(&title_buf, "{s}", .{node.identity[0..node.identity_len]}) catch "";
+                title_buf[tl.len] = 0;
+                drawTerminal(rt, remote_term_x[i], remote_term_y[i], &title_buf, false);
+            }
         }
         perf.lapEnd(perf_mod.DISPLAY);
 
@@ -279,25 +347,30 @@ pub fn main() !void {
 
         rl.endDrawing();
     }
+
+    // Cleanup remote terminals
+    for (&remote_terms) |*maybe_rt| {
+        if (maybe_rt.*) |rt| {
+            rt.deinit();
+            allocator.destroy(rt);
+            maybe_rt.* = null;
+        }
+    }
 }
 
-fn drawTerminal(term: *const terminal_mod.Terminal, wx: f32, wy: f32, focused: bool) void {
-    if (!term.visible) return;
+fn drawTerminal(t: *const terminal_mod.Terminal, wx: f32, wy: f32, title: [*:0]const u8, focused: bool) void {
+    if (!t.visible) return;
 
-    const tw: f32 = @floatFromInt(term.render_tex.texture.width);
-    const th: f32 = @floatFromInt(term.render_tex.texture.height);
+    const tw: f32 = @floatFromInt(t.render_tex.texture.width);
+    const th: f32 = @floatFromInt(t.render_tex.texture.height);
     const cy = wy + TITLE_BAR_H;
 
-    // Title bar
     const title_color = if (focused) rl.color(0, 120, 90, 240) else rl.color(0, 80, 60, 220);
     rl.c.DrawRectangleV(.{ .x = wx, .y = wy }, .{ .x = tw, .y = TITLE_BAR_H }, title_color);
+    rl.c.DrawText(title, @intFromFloat(wx + 6), @intFromFloat(wy + 4), 14, rl.color(0, 255, 180, 220));
 
-    rl.c.DrawText("Terminal", @intFromFloat(wx + 6), @intFromFloat(wy + 4), 14, rl.color(0, 255, 180, 220));
+    t.draw(wx, cy);
 
-    // Content
-    term.draw(wx, cy);
-
-    // Border
     const border_color = if (focused) rl.color(0, 255, 180, 220) else rl.color(0, 255, 180, 80);
     rl.c.DrawRectangleLinesEx(.{ .x = wx, .y = wy, .width = tw, .height = TITLE_BAR_H + th }, 1, border_color);
 
