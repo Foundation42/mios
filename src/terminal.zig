@@ -868,10 +868,10 @@ pub const Terminal = struct {
         // Full clear on first render or after scroll
         rl.c.ClearBackground(rl.c.Color{ .r = DEFAULT_BG.r, .g = DEFAULT_BG.g, .b = DEFAULT_BG.b, .a = DEFAULT_BG.a });
 
-        // Draw cells
+        // Draw cells — when scrolled, top rows come from scrollback
         for (0..self.rows) |r| {
             for (0..self.cols) |c_idx| {
-                const cell = self.cells_front[r * @as(usize, self.cols) + c_idx];
+                const cell = self.getDisplayCell(r, c_idx);
                 const x: f32 = @as(f32, @floatFromInt(c_idx)) * cw;
                 const y: f32 = @as(f32, @floatFromInt(r)) * ch;
 
@@ -978,6 +978,38 @@ pub const Terminal = struct {
         const src = rl.c.Rectangle{ .x = 0, .y = 0, .width = tw, .height = -th };
         const dst = rl.c.Rectangle{ .x = x, .y = y, .width = w, .height = h };
         rl.c.DrawTexturePro(tex, src, dst, rl.c.Vector2{ .x = 0, .y = 0 }, 0, rl.c.WHITE);
+    }
+
+    /// Get the cell to display at screen position (row, col), accounting for scroll offset.
+    /// When scrolled up, top rows come from the scrollback buffer.
+    fn getDisplayCell(self: *const Terminal, row: usize, col: usize) Cell {
+        if (self.scroll_offset == 0) {
+            return self.cells_front[row * @as(usize, self.cols) + col];
+        }
+
+        const scroll = self.scroll_offset;
+        const rows_u: u32 = @intCast(self.rows);
+
+        if (row < scroll) {
+            // This row comes from scrollback
+            // scrollback_head points to the next write position (one past the newest)
+            // We want: newest scrollback line = scroll_offset lines back from current top
+            // Row 0 on screen = the oldest visible scrollback line
+            const lines_from_bottom = scroll - @as(u32, @intCast(row));
+            if (lines_from_bottom > self.scrollback_count) {
+                return .{}; // empty — scrolled past available history
+            }
+            // scrollback is a ring: head is next write pos, so newest is head-1
+            const sb_idx = (@as(u32, self.scrollback_head) + SCROLLBACK_LINES - lines_from_bottom) % SCROLLBACK_LINES;
+            return self.scrollback[@as(usize, sb_idx) * @as(usize, MAX_COLS) + col];
+        } else {
+            // This row comes from the current screen content
+            const screen_row = row - @as(usize, scroll);
+            if (screen_row >= rows_u) {
+                return .{};
+            }
+            return self.cells_front[screen_row * @as(usize, self.cols) + col];
+        }
     }
 
     // ---------------------------------------------------------------
