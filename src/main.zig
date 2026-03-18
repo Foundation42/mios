@@ -43,9 +43,6 @@ pub fn main() !void {
     var term_wx: f32 = 50;
     var term_wy: f32 = 50;
 
-    // Track previous window size for resize detection
-    var prev_sw = rl.getScreenWidth();
-    var prev_sh = rl.getScreenHeight();
 
     // Which display is focused (null = terminal or nothing)
     var focused_display: ?usize = null;
@@ -64,19 +61,6 @@ pub fn main() !void {
         const sw = rl.getScreenWidth();
         const sh = rl.getScreenHeight();
 
-        // --- App window resize → resize terminal to fit ---
-        if (sw != prev_sw or sh != prev_sh) {
-            const margin: f32 = 100; // leave some room for display windows
-            const avail_w = @as(f32, @floatFromInt(sw)) - margin;
-            const avail_h = @as(f32, @floatFromInt(sh)) - margin - TITLE_BAR_H;
-            if (avail_w > 0 and avail_h > 0) {
-                const new_cols: u16 = @intFromFloat(@max(20, avail_w / term.cell_w));
-                const new_rows: u16 = @intFromFloat(@max(6, avail_h / term.cell_h));
-                term.resize(new_cols, new_rows);
-            }
-            prev_sw = sw;
-            prev_sh = sh;
-        }
 
         // Drain JS output to terminal
         js.drainOutput();
