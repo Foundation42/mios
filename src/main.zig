@@ -217,6 +217,15 @@ pub fn main() !void {
                     }
                 }
             }
+            // Remote terminal title bar → drag (check before local terminal since they overlap)
+            else if (hitTestRemoteTermTitle(remote_terms, &remote_term_x, &remote_term_y, mouse)) |idx| {
+                drag_target = .remote_term_title;
+                drag_remote_idx = idx;
+                drag_offset_x = mouse.x - remote_term_x[idx];
+                drag_offset_y = mouse.y - remote_term_y[idx];
+                term.focused = false;
+                focused_display = null;
+            }
             // Terminal resize grip
             else if (mouse_over_term_resize) {
                 drag_target = .term_resize;
@@ -238,15 +247,6 @@ pub fn main() !void {
             // Terminal content → focus
             else if (mouse_over_term_content) {
                 term.focused = true;
-                focused_display = null;
-            }
-            // Remote terminal title bar → drag
-            else if (hitTestRemoteTermTitle(remote_terms, &remote_term_x, &remote_term_y, mouse)) |idx| {
-                drag_target = .remote_term_title;
-                drag_remote_idx = idx;
-                drag_offset_x = mouse.x - remote_term_x[idx];
-                drag_offset_y = mouse.y - remote_term_y[idx];
-                term.focused = false;
                 focused_display = null;
             }
             // Display title bar → drag
