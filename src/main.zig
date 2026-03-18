@@ -310,7 +310,9 @@ pub fn main() !void {
                             t.write("\r\n");
                             const node = &nodes.nodes[node_idx];
                             if (node.console_remote_id != 0) {
-                                nodes.sendTo(node_idx, node.console_remote_id, 100, w.input_buf[0..w.input_len]);
+                                // Send even if empty — shell needs it for a new prompt
+                                const payload = if (w.input_len > 0) w.input_buf[0..w.input_len] else " ";
+                                nodes.sendTo(node_idx, node.console_remote_id, 100, payload);
                             }
                             w.input_len = 0;
                         }
