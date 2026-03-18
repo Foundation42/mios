@@ -1,4 +1,4 @@
-// Mount test — connect to real microkernel and send messages by name
+// Mount test — bidirectional communication with microkernel
 term.color("cyan");
 print("=== Microkernel Mount Test ===");
 term.reset();
@@ -16,23 +16,32 @@ if (!result || result === false) {
     term.reset();
 } else {
     term.color("green");
-    print("Node ID: " + result.nodeId + ", Identity: " + result.identity);
+    print("Node " + result.nodeId + " (" + result.identity + ")");
     term.reset();
 
-    // Send MSG_CONSOLE_WRITE to the console actor
-    // This writes directly to mk-shell's stdout
+    // Send to microkernel's console
     print("");
     term.color("yellow");
-    print("Sending to console...");
+    print(">>> Sending to mk-shell console...");
     term.reset();
+    actor.send("console", 0xFF000060, "\n[MiOS] Hello from the GUI shell!\n");
+    actor.send("console", 0xFF000060, "[MiOS] I registered /node/mios/console — try sending back!\n");
+    actor.send("console", 0xFF000060, "[MiOS] In mk-shell type: send mios-console Hello back!\n\n");
 
-    actor.send("console", 0xFF000060, "\n--- Message from MiOS ---\n");
-    actor.send("console", 0xFF000060, "Hello from MiOS! The GUI shell is connected.\n");
-    actor.send("console", 0xFF000060, "--- End of message ---\n\n");
-
+    // Poll for incoming messages (including ones to our registered actors)
     print("");
     term.color("cyan");
-    print("Check the mk-shell terminal!");
-    print("Bridge is live. Connected: " + actor.connected());
+    print("Listening for messages (type 'quit' to stop)...");
+    print("In mk-shell, send messages to mios-console to see them here.");
     term.reset();
+
+    while (true) {
+        const msg = actor.recv();
+        if (msg) {
+            term.color("green");
+            print("<<< [0x" + msg.type.toString(16) + "] " + msg.payload);
+            term.reset();
+        }
+        sleep(100);
+    }
 }

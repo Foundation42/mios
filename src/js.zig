@@ -85,6 +85,11 @@ pub const JsRuntime = struct {
     name_cache: bridge_mod.NameCache = .{},
     bridge_alloc: std.mem.Allocator = std.heap.page_allocator,
 
+    // MiOS actor IDs (node 15)
+    pub const MIOS_NODE: u32 = 15;
+    pub const MIOS_CONSOLE_ID: u64 = (@as(u64, MIOS_NODE) << 32) | 1;
+    pub const MIOS_DISPLAY_ID: u64 = (@as(u64, MIOS_NODE) << 32) | 2;
+
     const history_path = ".mios_history";
 
     pub fn init(self: *JsRuntime, term: *terminal_mod.Terminal) void {
@@ -1596,6 +1601,9 @@ pub const JsRuntime = struct {
             self.pushOutputFmt("\x1b[0;36mCached {d} namespace entries\x1b[0m\r\n", .{cached});
         }
 
+        // Register MiOS actors on the remote kernel (reverse mount)
+        self.registerRemoteActors();
+
         // Return info object
         const real_ctx = ctx orelse return c.qjs_true();
         const obj = c.JS_NewObject(real_ctx);
@@ -1663,25 +1671,34 @@ pub const JsRuntime = struct {
     }
 
     /// actor.recv() — receive a message (non-blocking). Returns {source, type, payload} or null.
-    /// Auto-caches namespace sync messages (name/path registrations).
+    /// Auto-dispatches messages to MiOS actors and caches namespace sync.
     fn jsActorRecv(ctx: ?*c.JSContext, _: c.JSValue, _: c_int, _: [*c]c.JSValue) callconv(.c) c.JSValue {
         const self = getSelf(ctx);
         const real_ctx = ctx orelse return c.qjs_null();
 
         if (!self.bridge.isConnected()) return c.qjs_null();
 
-        const msg = self.bridge.recv(self.bridge_alloc) orelse return c.qjs_null();
-        defer if (msg.payload.len > 0) self.bridge_alloc.free(msg.payload);
+        // Keep reading until we find a message for JS (not handled internally)
+        while (true) {
+            const msg = self.bridge.recv(self.bridge_alloc) orelse return c.qjs_null();
 
-        // Auto-cache namespace registrations
-        self.cacheNameSync(msg);
+            // Auto-cache namespace registrations
+            self.cacheNameSync(msg);
 
-        // Return as JS object {source, type, payload}
-        const obj = c.JS_NewObject(real_ctx);
-        _ = c.JS_SetPropertyStr(real_ctx, obj, "source", c.JS_NewInt64(real_ctx, @bitCast(msg.source)));
-        _ = c.JS_SetPropertyStr(real_ctx, obj, "type", c.JS_NewInt64(real_ctx, @intCast(msg.msg_type)));
-        _ = c.JS_SetPropertyStr(real_ctx, obj, "payload", c.JS_NewStringLen(real_ctx, msg.payload.ptr, msg.payload.len));
-        return obj;
+            // Dispatch to MiOS actors (console, display) — if handled, skip to next
+            if (self.dispatchIncoming(msg)) {
+                if (msg.payload.len > 0) self.bridge_alloc.free(msg.payload);
+                continue;
+            }
+
+            // Not handled internally — return to JS
+            defer if (msg.payload.len > 0) self.bridge_alloc.free(msg.payload);
+            const obj = c.JS_NewObject(real_ctx);
+            _ = c.JS_SetPropertyStr(real_ctx, obj, "source", c.JS_NewInt64(real_ctx, @bitCast(msg.source)));
+            _ = c.JS_SetPropertyStr(real_ctx, obj, "type", c.JS_NewInt64(real_ctx, @intCast(msg.msg_type)));
+            _ = c.JS_SetPropertyStr(real_ctx, obj, "payload", c.JS_NewStringLen(real_ctx, msg.payload.ptr, msg.payload.len));
+            return obj;
+        }
     }
 
     /// Drain all pending messages, caching namespace entries. Returns count.
@@ -1715,6 +1732,72 @@ pub const JsRuntime = struct {
             const actor_id: u64 = @bitCast(id_bytes);
             self.name_cache.put(path, actor_id);
         }
+    }
+
+    /// Register MiOS actors on the remote microkernel.
+    fn registerRemoteActors(self: *JsRuntime) void {
+        // Register name "mios-console" → MIOS_CONSOLE_ID
+        self.sendNameRegister("mios-console", MIOS_CONSOLE_ID);
+        self.sendPathRegister("/node/mios/console", MIOS_CONSOLE_ID);
+
+        // Register name "mios-display" → MIOS_DISPLAY_ID
+        self.sendNameRegister("mios-display", MIOS_DISPLAY_ID);
+        self.sendPathRegister("/node/mios/display", MIOS_DISPLAY_ID);
+
+        self.pushOutput("\x1b[0;36mRegistered MiOS actors: /node/mios/console, /node/mios/display\x1b[0m\r\n");
+    }
+
+    fn sendNameRegister(self: *JsRuntime, name: []const u8, actor_id: u64) void {
+        // Payload: name[64] + actor_id(u64) = 72 bytes
+        var payload: [72]u8 = .{0} ** 72;
+        const copy_len = @min(name.len, 63);
+        @memcpy(payload[0..copy_len], name[0..copy_len]);
+        const id_bytes: [8]u8 = @bitCast(actor_id);
+        @memcpy(payload[64..72], &id_bytes);
+
+        _ = self.bridge.send(self.bridge_alloc, .{
+            .source = actor_id,
+            .dest = 0, // broadcast
+            .msg_type = bridge_mod.MSG.NAME_REGISTER,
+            .payload = &payload,
+        });
+    }
+
+    fn sendPathRegister(self: *JsRuntime, path: []const u8, actor_id: u64) void {
+        // Payload: path[128] + actor_id(u64) = 136 bytes
+        var payload: [136]u8 = .{0} ** 136;
+        const copy_len = @min(path.len, 127);
+        @memcpy(payload[0..copy_len], path[0..copy_len]);
+        const id_bytes: [8]u8 = @bitCast(actor_id);
+        @memcpy(payload[128..136], &id_bytes);
+
+        _ = self.bridge.send(self.bridge_alloc, .{
+            .source = actor_id,
+            .dest = 0, // broadcast
+            .msg_type = bridge_mod.MSG.PATH_REGISTER,
+            .payload = &payload,
+        });
+    }
+
+    /// Dispatch an incoming message to the right MiOS actor.
+    /// Returns true if the message was handled locally.
+    fn dispatchIncoming(self: *JsRuntime, msg: bridge_mod.Message) bool {
+        // Console: write to our terminal
+        if (msg.dest == MIOS_CONSOLE_ID and msg.msg_type == bridge_mod.MSG.CONSOLE_WRITE) {
+            if (msg.payload.len > 0) {
+                self.pushOutput(msg.payload);
+            }
+            return true;
+        }
+
+        // Display commands: translate to gfx commands
+        // (future: MSG_DISPLAY_DRAW, MSG_DISPLAY_TEXT, etc.)
+        if (msg.dest == MIOS_DISPLAY_ID) {
+            // TODO: translate MSG_DISPLAY_* to display manager commands
+            return true;
+        }
+
+        return false;
     }
 
     fn extractCStr(buf: []const u8) []const u8 {
