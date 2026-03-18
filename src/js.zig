@@ -1696,16 +1696,14 @@ pub const JsRuntime = struct {
     }
 
     /// Cache name/path registration messages into the name cache.
+    /// Payload actor_ids are in host byte order (only wire headers are swapped).
     fn cacheNameSync(self: *JsRuntime, msg: bridge_mod.Message) void {
-        const is_net = (self.bridge.mode == .network);
-
         // MSG_NAME_REGISTER: name[64] + actor_id(u64) = 72 bytes
         if (msg.msg_type == bridge_mod.MSG.NAME_REGISTER and msg.payload.len >= 72) {
             const name = extractCStr(msg.payload[0..64]);
             var id_bytes: [8]u8 = undefined;
             @memcpy(&id_bytes, msg.payload[64..72]);
-            var actor_id: u64 = @bitCast(id_bytes);
-            if (is_net) actor_id = @byteSwap(actor_id);
+            const actor_id: u64 = @bitCast(id_bytes);
             self.name_cache.put(name, actor_id);
         }
 
@@ -1714,8 +1712,7 @@ pub const JsRuntime = struct {
             const path = extractCStr(msg.payload[0..128]);
             var id_bytes: [8]u8 = undefined;
             @memcpy(&id_bytes, msg.payload[128..136]);
-            var actor_id: u64 = @bitCast(id_bytes);
-            if (is_net) actor_id = @byteSwap(actor_id);
+            const actor_id: u64 = @bitCast(id_bytes);
             self.name_cache.put(path, actor_id);
         }
     }
