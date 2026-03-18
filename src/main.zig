@@ -342,16 +342,15 @@ pub fn main() !void {
                     }
                 }
 
-                // Enter → send line to remote shell
+                // Enter → send line to remote console (which forwards to shell)
                 if (rl.isKeyPressed(rl.c.KEY_ENTER)) {
                     rt.write("\r\n");
                     const node = &nodes.nodes[rf_idx];
-                    if (node.shell_actor_id != 0) {
-                        // MSG_SHELL_INPUT = 100
-                        nodes.sendTo(@intCast(rf_idx), node.shell_actor_id, 100, remote_input_buf[0..remote_input_len]);
+                    if (node.console_remote_id != 0) {
+                        // MSG_SHELL_INPUT = 100, sent to console which forwards to shell
+                        nodes.sendTo(@intCast(rf_idx), node.console_remote_id, 100, remote_input_buf[0..remote_input_len]);
                     }
                     remote_input_len = 0;
-                    rt.write("\x1b[1;33mmk>\x1b[0m ");
                 }
 
                 // Backspace
