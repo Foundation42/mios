@@ -278,11 +278,13 @@ pub const NodeManager = struct {
         node.console_actor_id = console_id;
         node.display_actor_id = display_id;
 
-        // Wait for namespace sync
-        std.time.sleep(100 * std.time.ns_per_ms);
-        while (node.conn.recv(self.alloc)) |msg| {
-            defer if (msg.payload.len > 0) self.alloc.free(msg.payload);
-            cacheNameSync(node, msg);
+        // Wait for namespace sync — drain multiple times to catch late registrations
+        for (0..5) |_| {
+            std.time.sleep(100 * std.time.ns_per_ms);
+            while (node.conn.recv(self.alloc)) |msg| {
+                defer if (msg.payload.len > 0) self.alloc.free(msg.payload);
+                cacheNameSync(node, msg);
+            }
         }
 
         // Look up remote shell and console actors

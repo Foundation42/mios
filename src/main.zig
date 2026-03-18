@@ -113,8 +113,11 @@ pub fn main() !void {
                 rt.write(welcome);
 
                 // Notify local terminal
+                const node = nodes.nodes[result.slot];
                 var nbuf: [256]u8 = undefined;
-                const notify = std.fmt.bufPrint(&nbuf, "\x1b[1;32mMounted {s} — terminal opened\x1b[0m\r\n", .{ident}) catch "";
+                const notify = std.fmt.bufPrint(&nbuf, "\x1b[1;32mMounted {s} — shell=0x{x} console=0x{x}\x1b[0m\r\n", .{
+                    ident, node.shell_actor_id, node.console_remote_id,
+                }) catch "";
                 term.write(notify);
             } else {
                 term.write("\x1b[1;31mMount failed\x1b[0m\r\n");
