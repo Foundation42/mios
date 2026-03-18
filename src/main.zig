@@ -292,12 +292,7 @@ fn drawTerminal(term: *const terminal_mod.Terminal, wx: f32, wy: f32, focused: b
     const title_color = if (focused) rl.color(0, 120, 90, 240) else rl.color(0, 80, 60, 220);
     rl.c.DrawRectangleV(.{ .x = wx, .y = wy }, .{ .x = tw, .y = TITLE_BAR_H }, title_color);
 
-    // Debug: show scroll state in title bar
-    var title_buf: [128:0]u8 = undefined;
-    const wheel = rl.c.GetMouseWheelMove();
-    const tl = std.fmt.bufPrint(&title_buf, "Terminal {d}x{d}  sb={d} off={d} wh={d:.1}", .{ term.cols, term.rows, term.scrollback_count, term.scroll_offset, wheel }) catch "";
-    title_buf[tl.len] = 0;
-    rl.c.DrawText(&title_buf, @intFromFloat(wx + 6), @intFromFloat(wy + 4), 14, rl.color(0, 255, 180, 220));
+    rl.c.DrawText("Terminal", @intFromFloat(wx + 6), @intFromFloat(wy + 4), 14, rl.color(0, 255, 180, 220));
 
     // Content
     term.draw(wx, cy);
