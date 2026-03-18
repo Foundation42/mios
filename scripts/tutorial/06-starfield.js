@@ -2,7 +2,7 @@
 gfx.create(0, 500, 400);
 gfx.move(0, 50, 30);
 
-const NUM_STARS = 200;
+const NUM_STARS = 2000;
 const cx = 250, cy = 200;
 const stars = [];
 
